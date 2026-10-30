@@ -69,6 +69,10 @@ func limitOf(err error, now time.Time) (limit, bool) {
 	return limit{}, false
 }
 
+// limitMargin is how much longer than Devin says a rate limit is waited out, so the next turn is
+// not the one that finds it still in force.
+const limitMargin = time.Minute
+
 // limitWaits is how many rate limits in a row one turn waits out before giving up.
 const limitWaits = 5
 
@@ -86,14 +90,15 @@ func (d *devin) prompt(ctx context.Context, session, text string, waiting func(l
 		if !limited || !l.rate || attempt == limitWaits {
 			return result, err
 		}
-		log.Printf("Devin session %s is rate limited until %s", session, l.until.Local().Format("15:04:05"))
+		l.until = l.until.Add(limitMargin)
+		log.Printf("Devin session %s is rate limited; waiting until %s", session, l.until.Local().Format("15:04:05"))
 		if waiting != nil {
 			waiting(l)
 		}
 		select {
 		case <-ctx.Done():
 			return result, err
-		case <-time.After(time.Until(l.until) + 5*time.Second):
+		case <-time.After(time.Until(l.until)):
 		}
 		text = continueAfterLimit
 	}
