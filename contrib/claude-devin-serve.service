@@ -1,0 +1,14 @@
+[Unit]
+Description=Devin as an OpenAI-compatible model for OpenCode (claude-devin-acp --serve)
+After=network.target
+
+[Service]
+ExecStart=/home/osc/Projects/claude-devin-acp/claude-devin-acp --serve 127.0.0.1:47821
+WorkingDirectory=%h
+# devin is Homebrew's; a user service does not get the login shell's PATH.
+Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -56,6 +56,26 @@ is the RFD form this proxy speaks.
 In a "Claude + Devin" thread, ask Claude to hand something to Devin. A "Devin + Devin" thread is
 Devin's own, as Zed's registry Devin would be, but its subagents are shown as cards.
 
+## OpenCode: Devin as a model (`--serve`)
+
+OpenCode drives no ACP agent (its ACP client mode was closed as not planned) but takes any
+OpenAI-compatible provider, so `--serve 127.0.0.1:47821` answers chat completions with a Devin
+session: Devin's text as content, its thoughts as reasoning, its tool calls and any subagent it
+starts as lines. A conversation is known by its first user message and the working directory
+OpenCode's prompt states, so a follow-up reaches the same Devin session. Devin is told to do the
+task itself; a permission it asks for is refused, with nobody to ask.
+
+In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
+subagent`, `model: devin/devin`); Claude, through OpenCode's Claude Agent provider, starts it
+with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
+
+To keep it running: `contrib/claude-devin-serve.service`, as a user service:
+
+```sh
+cp contrib/claude-devin-serve.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now claude-devin-serve
+```
+
 ## Devin + Devin
 
 Zed sends the RFD's `subagents` capability, which Devin ignores; Devin reports its subagents only
