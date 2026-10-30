@@ -130,9 +130,9 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort
 
 func (s *server) models(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	models := []any{map[string]any{"id": "devin", "object": "model", "owned_by": "cognition"}}
+	var models []any
 	for _, effort := range []string{"medium", "high", "max"} {
-		models = append(models, map[string]any{"id": "devin-" + effort, "object": "model", "owned_by": "cognition"})
+		models = append(models, map[string]any{"id": "swe-2-" + effort, "object": "model", "owned_by": "cognition"})
 	}
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
@@ -502,11 +502,12 @@ func (o *reply) finish() {
 	})
 }
 
-// effortOf is the thinking a request asks Devin for: the model's own (`devin-max`), else the
+// effortOf is the thinking a request asks Devin for: the model's own (`swe-2-max`, Devin's own
+// names for SWE-2 at each effort), else the
 // request's `reasoning_effort` where it is one Devin takes (low is taken as medium), else none,
 // for the server's default.
 func effortOf(chat chatRequest) string {
-	if effort, ok := strings.CutPrefix(chat.Model, "devin-"); ok && efforts[effort] {
+	if effort, ok := strings.CutPrefix(chat.Model, "swe-2-"); ok && efforts[effort] {
 		return effort
 	}
 	switch chat.ReasoningEffort {

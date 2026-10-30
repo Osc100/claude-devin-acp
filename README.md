@@ -66,11 +66,11 @@ OpenCode's prompt states, so a follow-up reaches the same Devin session. Devin i
 task itself; a permission it asks for is refused, with nobody to ask.
 
 Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
-`--devin-effort` (high) by default, the model `devin-medium`, `devin-high` or `devin-max`, or a
-request's `reasoning_effort`. In Claude + Devin, `start_task` takes an `effort`.
+`--devin-effort` (high) by default, the model `swe-2-medium`, `swe-2-high` or `swe-2-max` (Devin's
+own names), or a request's `reasoning_effort`. In Claude + Devin, `start_task` takes an `effort`.
 
 In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
-subagent`, `model: devin/devin`); Claude, through OpenCode's Claude Agent provider, starts it
+subagent`, `model: devin/swe-2-high`); Claude, through OpenCode's Claude Agent provider, starts it
 with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
 
 To keep it running: `contrib/claude-devin-serve.service`, as a user service:

@@ -62,3 +62,11 @@ func TestTheWorkingDirectoryIsReadOffOpenCodesPrompt(t *testing.T) {
 		t.Errorf("read %v", found)
 	}
 }
+
+func TestTheModelSaysTheEffort(t *testing.T) {
+	for model, want := range map[string]string{"swe-2-max": "max", "swe-2-medium": "medium", "swe-2-high": "high", "devin": ""} {
+		if got := effortOf(chatRequest{Model: model}); got != want {
+			t.Errorf("%s asked for %q, not %q", model, got, want)
+		}
+	}
+}
