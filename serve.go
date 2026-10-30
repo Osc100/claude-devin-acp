@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -131,16 +132,19 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	}
 	conversation, prompt, err := s.turn(cwd, users)
 	if err != nil {
+		log.Printf("turn refused in %s: %v", cwd, err)
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	log.Printf("turn %d of %s in %s (stream %v)", conversation.users, conversation.r.devinSession, cwd, chat.Stream)
+	out := newReply(w, chat.Stream)
+	out.cwd = cwd
 	defer func() {
 		s.mu.Lock()
 		conversation.busy = false
 		s.mu.Unlock()
 	}()
 
-	out := newReply(w, chat.Stream)
 	events := make(chan event, 4096)
 	r := conversation.r
 	r.mu.Lock()
@@ -173,6 +177,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 		case <-tick.C:
 			out.keepalive()
 		case <-req.Context().Done():
+			log.Printf("the client gave up turn %d of %s; cancelling it", conversation.users, r.devinSession)
 			s.d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
 			<-done
 			return
@@ -184,6 +189,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 				out.line("✗ Devin did not finish: " + err.Error())
 			}
 			out.finish()
+			log.Printf("turn %d of %s ended (error: %v)", conversation.users, r.devinSession, err)
 			return
 		}
 	}
@@ -252,6 +258,7 @@ type reply struct {
 	w        http.ResponseWriter
 	flusher  http.Flusher
 	stream   bool
+	cwd      string // the directory paths in lines are said relative to
 	id       string
 	started  bool
 	atLine   bool // whether what was written last ends a line of its own
@@ -367,17 +374,17 @@ func (o *reply) event(e event) {
 		if strings.HasPrefix(id, "run_subagent:") || strings.HasPrefix(id, "read_subagent:") {
 			return // said by the subagent's own lines
 		}
-		o.line("⚙ " + toolTitle(update, meta))
+		o.line("⚙ " + toolTitle(update, meta, o.cwd))
 	case "tool_call_update":
 		if status, _ := update["status"].(string); status == "failed" {
-			o.line("✗ " + toolTitle(update, meta) + " failed")
+			o.line("✗ " + toolTitle(update, meta, o.cwd) + " failed")
 		}
 	}
 }
 
 // toolTitle is a tool call as a line says it: Devin's title for it, and what it was called on
 // (a file, a command, a pattern) when the call names one, since "Read file" alone says little.
-func toolTitle(update, meta map[string]any) string {
+func toolTitle(update, meta map[string]any, cwd string) string {
 	title, _ := update["title"].(string)
 	if title == "" || title == "Tool" {
 		title, _ = meta["cognition.ai/inferenceToolName"].(string)
@@ -388,6 +395,11 @@ func toolTitle(update, meta map[string]any) string {
 	input, _ := update["rawInput"].(map[string]any)
 	for _, key := range []string{"file_path", "path", "command", "pattern", "query", "url"} {
 		if value, _ := input[key].(string); value != "" && !strings.Contains(title, value) {
+			if cwd != "" {
+				if rel, err := filepath.Rel(cwd, value); err == nil && !strings.HasPrefix(rel, "..") {
+					value = rel
+				}
+			}
 			return title + ": " + firstLine(value)
 		}
 	}
