@@ -43,7 +43,7 @@ func TestARecordedTurnStreamsAsTextAndLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := reply.Choices[0].Message.Content
-	for _, want := range []string{"⚙ Devin subagent (Explore)", "✓ subagent finished", "5"} {
+	for _, want := range []string{"Started a subagent (Explore)", "Subagent finished", "5"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("the reply does not say %q:\n%s", want, content)
 		}
@@ -67,6 +67,18 @@ func TestTheModelSaysTheEffort(t *testing.T) {
 	for model, want := range map[string]string{"swe-2-max": "max", "swe-2-medium": "medium", "swe-2-high": "high", "devin": ""} {
 		if got := effortOf(chatRequest{Model: model}); got != want {
 			t.Errorf("%s asked for %q, not %q", model, got, want)
+		}
+	}
+}
+
+// A message reaches only a Devin that is in a turn; otherwise Claude is told where it went wrong.
+func TestAMessageNeedsATaskInATurn(t *testing.T) {
+	s := &server{sessions: map[string]*served{"ses_done": {r: &run{}}}}
+	for session, want := range map[string]string{"ses_none": "no Devin task", "ses_done": "continue it with the subagent tool"} {
+		result := s.call(map[string]any{"name": "message_task", "arguments": map[string]any{"sessionID": session, "message": "stop"}})
+		text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+		if result["isError"] != true || !strings.Contains(text, want) {
+			t.Errorf("%s: %v", session, result)
 		}
 	}
 }

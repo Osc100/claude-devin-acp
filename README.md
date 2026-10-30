@@ -61,8 +61,9 @@ Devin's own, as Zed's registry Devin would be, but its subagents are shown as ca
 OpenCode drives no ACP agent (its ACP client mode was closed as not planned) but takes any
 OpenAI-compatible provider, so `--serve 127.0.0.1:47821` answers chat completions with a Devin
 session: Devin's text as content, its thoughts as reasoning, its tool calls and any subagent it
-starts as lines. A conversation is known by its first user message and the working directory
-OpenCode's prompt states, so a follow-up reaches the same Devin session. Devin is told to do the
+starts as lines. A conversation is known by the session OpenCode names (`x-opencode-session-id`),
+else by its first user message and the working directory OpenCode's prompt states, so a follow-up
+reaches the same Devin session. Devin is told to do the
 task itself; a permission it asks for is refused, with nobody to ask.
 
 Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
@@ -72,6 +73,12 @@ own names), or a request's `reasoning_effort`. In Claude + Devin, `start_task` t
 In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
 subagent`, `model: devin/swe-2-high`); Claude, through OpenCode's Claude Agent provider, starts it
 with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
+
+Steering: OpenCode holds a message for a busy subagent until its step ends, and a step here is
+Devin's whole turn. So the server is also an MCP server at `/mcp`, whose `message_task` takes the
+subagent's session id and a message and hands it to Devin at once; Devin takes it as the user
+interrupting, and the subagent's reply goes on with what it does then. In OpenCode:
+`"mcp": {"servers": {"devin": {"type": "remote", "url": "http://127.0.0.1:47821/mcp", "oauth": false, "codemode": false}}}`.
 
 To keep it running: `contrib/claude-devin-serve.service`, as a user service:
 

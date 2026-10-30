@@ -55,11 +55,20 @@ const devinTools = `[{
 
 func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, found := strings.CutPrefix(r.URL.Path, "/mcp/")
-	parent, known := s.p.sessionOf(token)
-	if !found || !known {
+	if _, known := s.p.sessionOf(token); !found || !known {
 		http.NotFound(w, r)
 		return
 	}
+	serveMCP(w, r, devinTools, func(params map[string]any) map[string]any {
+		// Looked up at the call, not at the connection: the session was still being opened then.
+		parent, _ := s.p.sessionOf(token)
+		return s.call(r, parent, params)
+	})
+}
+
+// serveMCP answers one MCP request in Streamable HTTP's plain form: POSTed, and answered with one
+// JSON body. tools is the tools/list answer, and call answers a tools/call.
+func serveMCP(w http.ResponseWriter, r *http.Request, tools string, call func(params map[string]any) map[string]any) {
 	switch r.Method {
 	case http.MethodPost:
 	case http.MethodDelete:
@@ -102,11 +111,9 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		reply["result"] = map[string]any{}
 	case "tools/list":
-		reply["result"] = map[string]any{"tools": json.RawMessage(devinTools)}
+		reply["result"] = map[string]any{"tools": json.RawMessage(tools)}
 	case "tools/call":
-		// Looked up at the call, not at the connection: the session was still being opened then.
-		parent, _ = s.p.sessionOf(token)
-		reply["result"] = s.call(r, parent, params)
+		reply["result"] = call(params)
 	default:
 		reply["error"] = map[string]any{"code": -32601, "message": "no method " + method}
 	}

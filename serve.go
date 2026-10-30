@@ -29,8 +29,15 @@ import (
 // anyway is the two lines, its start and its summary, never sessions of the client's.
 //
 // The client sends the whole conversation every turn, as chat clients do, so a conversation is
-// known by its first user message and directory, and only what is new reaches Devin: a follow-up
-// is a prompt in the same Devin session.
+// known by the session OpenCode says it is (`x-opencode-session-id`), else by its first user
+// message and directory, and only what is new reaches Devin: a follow-up is a prompt in the same
+// Devin session.
+//
+// A turn can be steered while it runs: OpenCode holds a message for a busy session until the
+// step ends, and a step here is Devin's whole turn, so the server is also an MCP server (`/mcp`)
+// whose message_task hands a message to the Devin of an OpenCode session at once. Devin takes a
+// prompt in the middle of a turn as the user interrupting it, and the turn's reply goes on with
+// what it does then.
 
 // soloInstruction ends the first prompt of every session: Devin here is one subagent of another
 // agent's, and its own subagents would be work nobody sees.
@@ -59,6 +66,8 @@ type served struct {
 	// users is how many of the conversation's user messages Devin has been given.
 	users int
 	busy  bool
+	// live is whether Devin is in a turn of it, which a message steers.
+	live bool
 }
 
 // kept is a conversation as the store keeps it.
@@ -124,6 +133,7 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.complete)
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, steerTools, s.call) })
 	log.Printf("serving Devin as a model on http://%s/v1", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
@@ -193,7 +203,12 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	if found := workingDirectory.FindStringSubmatch(system.String()); found != nil {
 		cwd = found[1]
 	}
-	conversation, prompt, err := s.turn(cwd, users)
+	key := req.Header.Get("x-opencode-session-id")
+	if key == "" {
+		sum := sha256.Sum256([]byte(cwd + "\x00" + users[0]))
+		key = hex.EncodeToString(sum[:])
+	}
+	conversation, prompt, err := s.turn(key, cwd, users)
 	if err != nil {
 		log.Printf("turn refused in %s: %v", cwd, err)
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -204,7 +219,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	out.cwd = cwd
 	defer func() {
 		s.mu.Lock()
-		conversation.busy = false
+		conversation.busy, conversation.live = false, false
 		s.mu.Unlock()
 	}()
 
@@ -223,22 +238,30 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	s.d.busy()
 	defer s.d.rested()
 	if err := s.d.open(r); err != nil {
-		out.line("✗ " + err.Error())
+		out.line("Devin did not start: " + err.Error())
 		out.finish()
 		return
 	}
 	if err := s.d.configure(r, effortOf(chat)); err != nil {
-		out.line("✗ " + err.Error())
+		out.line("Devin did not start: " + err.Error())
 		out.finish()
 		return
 	}
+	s.mu.Lock()
+	conversation.live = true
+	s.mu.Unlock()
 	go func() {
 		result, err := s.d.request("session/prompt", map[string]any{
 			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": prompt}},
 		})
 		if err == nil {
-			if stop, _ := result["stopReason"].(string); stop == "cancelled" {
+			switch stop, _ := result["stopReason"].(string); stop {
+			case "", "end_turn":
+			case "cancelled":
 				err = errors.New("Devin's turn was cancelled")
+			default:
+				// max_tokens, max_turn_requests, refusal: the turn ended before the work did.
+				err = errors.New("Devin stopped early (" + stop + ")")
 			}
 		}
 		done <- err
@@ -261,7 +284,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 				out.event(<-events)
 			}
 			if err != nil {
-				out.line("✗ Devin did not finish: " + err.Error())
+				out.line("Devin did not finish: " + err.Error())
 			}
 			out.finish()
 			log.Printf("turn %d of %s ended (error: %v)", conversation.users, r.devinSession, err)
@@ -272,9 +295,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 
 // turn is the Devin session a request's conversation is, opened on its first turn, and what to
 // prompt it with: the user messages it has not been given yet.
-func (s *server) turn(cwd string, users []string) (*served, string, error) {
-	sum := sha256.Sum256([]byte(cwd + "\x00" + users[0]))
-	key := hex.EncodeToString(sum[:])
+func (s *server) turn(key, cwd string, users []string) (*served, string, error) {
 	s.mu.Lock()
 	conversation := s.sessions[key]
 	if conversation != nil && conversation.busy {
@@ -322,6 +343,62 @@ func (s *server) turn(cwd string, users []string) (*served, string, error) {
 	s.save()
 	s.mu.Unlock()
 	return conversation, prompt, nil
+}
+
+const steerTools = `[{
+  "name": "message_task",
+  "title": "Message a running Devin task",
+  "description": "Send a message to Devin while it works on a task you gave it as a background subagent, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. Devin reads it at once, as an interruption, and its reply to the subagent call covers what it did after. Only for a task still running; a finished one is continued with the subagent tool and its sessionID.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "sessionID": {"type": "string", "description": "The subagent session Devin is working in, as the subagent tool gave it."},
+      "message": {"type": "string", "description": "What to tell Devin."}
+    },
+    "required": ["sessionID", "message"]
+  }
+}]`
+
+// steered is the update a turn's watcher is handed for a message given to Devin mid-turn.
+const steered = "_steered"
+
+func (s *server) call(params map[string]any) map[string]any {
+	if name, _ := params["name"].(string); name != "message_task" {
+		return toolResult("no tool "+name, true)
+	}
+	args, _ := params["arguments"].(map[string]any)
+	session, _ := args["sessionID"].(string)
+	message, _ := args["message"].(string)
+	if strings.TrimSpace(message) == "" {
+		return toolResult("message is required", true)
+	}
+	s.mu.Lock()
+	conversation := s.sessions[session]
+	live := conversation != nil && conversation.live
+	s.mu.Unlock()
+	if conversation == nil {
+		return toolResult("no Devin task in session "+session, true)
+	}
+	if !live {
+		return toolResult("Devin is not working on session "+session+" now; continue it with the subagent tool and this sessionID", true)
+	}
+	r := conversation.r
+	r.mu.Lock()
+	watch := r.watch
+	r.mu.Unlock()
+	if watch != nil {
+		watch(rootAgent, map[string]any{"sessionUpdate": steered, "message": message})
+	}
+	// Answered when the turn it joins ends, as the turn's own prompt is; nothing waits for it.
+	go func() {
+		if _, err := s.d.request("session/prompt", map[string]any{
+			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": message}},
+		}); err != nil {
+			log.Printf("steering %s: %v", r.devinSession, err)
+		}
+	}()
+	log.Printf("steered %s (%s)", r.devinSession, session)
+	return toolResult("Devin has the message and is going on with it; its reply to the subagent call covers what it does now.", false)
 }
 
 type event struct {
@@ -413,22 +490,30 @@ func (o *reply) event(e event) {
 	if started, _ := meta[metaStarted].(map[string]any); started != nil {
 		title, _ := started["title"].(string)
 		profile, _ := started["profile"].(string)
-		o.line(fmt.Sprintf("⚙ Devin subagent (%s): %s", profile, title))
+		o.line(fmt.Sprintf("Started a subagent (%s): %s", profile, title))
 		return
 	}
 	if completed, _ := meta[metaCompleted].(map[string]any); completed != nil {
 		summary, _ := completed["summary"].(string)
 		if success, _ := completed["success"].(bool); success {
-			o.line("✓ subagent finished: " + firstLine(summary))
+			o.line("Subagent finished: " + firstLine(summary))
 		} else {
-			o.line("✗ subagent failed: " + firstLine(summary))
+			o.line("Subagent failed: " + firstLine(summary))
 		}
 		return
 	}
 	kind, _ := update["sessionUpdate"].(string)
+	if kind == steered {
+		message, _ := update["message"].(string)
+		o.line("Message from the lead agent: " + firstLine(message))
+		return
+	}
 	if kind == permissionRefused {
-		title, _ := update["title"].(string)
-		o.line("✗ Devin asked permission to " + title + "; refused, with nobody here to ask")
+		what := "Devin asked for a permission"
+		if title, _ := update["title"].(string); title != "" {
+			what = "Devin asked permission to " + title
+		}
+		o.line(what + "; refused, with nobody here to ask")
 		return
 	}
 	if e.owner != rootAgent {
@@ -450,10 +535,10 @@ func (o *reply) event(e event) {
 		if strings.HasPrefix(id, "run_subagent:") || strings.HasPrefix(id, "read_subagent:") {
 			return // said by the subagent's own lines
 		}
-		o.line("⚙ " + toolTitle(update, meta, o.cwd))
+		o.line(toolTitle(update, meta, o.cwd))
 	case "tool_call_update":
 		if status, _ := update["status"].(string); status == "failed" {
-			o.line("✗ " + toolTitle(update, meta, o.cwd) + " failed")
+			o.line("Failed: " + toolTitle(update, meta, o.cwd))
 		}
 	}
 }
