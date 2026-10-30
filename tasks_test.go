@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -111,5 +112,25 @@ func TestAPermissionRequestIsTheCallDevinAnnounced(t *testing.T) {
 	if !ownTool(map[string]any{"_meta": map[string]any{"cognition.ai/permissionRule": "mcp__permissions__decide_permission"}}) ||
 		ownTool(map[string]any{"_meta": map[string]any{"cognition.ai/toolName": "exec"}}) {
 		t.Error("the reviewer's own tool is not told apart")
+	}
+}
+
+func TestALimitIsReadOffDevinsError(t *testing.T) {
+	now := time.Date(2026, 10, 30, 6, 42, 10, 0, time.UTC)
+	rate := &acpError{method: "session/prompt", code: -32010, message: "Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 2 minutes (at 06:44 UTC)."}
+	l, ok := limitOf(fmt.Errorf("turn: %w", rate), now)
+	if !ok || !l.rate || !l.until.Equal(time.Date(2026, 10, 30, 6, 44, 0, 0, time.UTC)) {
+		t.Errorf("rate limit read as %+v, %v", l, ok)
+	}
+	late := &acpError{message: "Reached free model rate limit. Your limit will reset in 1 minute (at 00:01 UTC)."}
+	if l, _ := limitOf(late, time.Date(2026, 10, 30, 23, 59, 30, 0, time.UTC)); l.until.Day() != 31 {
+		t.Errorf("a reset past midnight is %v", l.until)
+	}
+	quota := &acpError{message: "Quota exhausted: Your daily usage quota has been exhausted. Visit https://app.devin.ai/settings/usage to purchase on-demand usage or turn on auto-reload."}
+	if l, ok := limitOf(quota, now); !ok || l.rate {
+		t.Errorf("quota read as %+v, %v", l, ok)
+	}
+	if _, ok := limitOf(&acpError{message: "no such session"}, now); ok {
+		t.Error("an unrelated error is a limit")
 	}
 }

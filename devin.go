@@ -321,7 +321,9 @@ func (d *devin) request(method string, params any) (map[string]any, error) {
 	in.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
 	msg := <-answer
 	if e, ok := msg["error"].(map[string]any); ok {
-		return nil, fmt.Errorf("Devin refused %s: %v", method, e["message"])
+		code, _ := e["code"].(float64)
+		message, _ := e["message"].(string)
+		return nil, &acpError{method: method, code: int(code), message: message}
 	}
 	result, _ := msg["result"].(map[string]any)
 	return result, nil
@@ -711,9 +713,7 @@ func (d *devin) begin(parent, task, title, cwd, cont, effort string) (*run, erro
 func (d *devin) turn(r *run, task string) {
 	d.busy()
 	defer d.rested()
-	result, err := d.request("session/prompt", map[string]any{
-		"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": task}},
-	})
+	result, err := d.prompt(context.Background(), r.devinSession, task, nil)
 	stop, _ := result["stopReason"].(string)
 	if err == nil && stop == "cancelled" {
 		err = errors.New("Devin's turn was cancelled")

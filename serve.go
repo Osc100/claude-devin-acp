@@ -302,8 +302,8 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	conversation.live = true
 	s.mu.Unlock()
 	go func() {
-		result, err := s.d.request("session/prompt", map[string]any{
-			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": prompt}},
+		result, err := s.d.prompt(req.Context(), r.devinSession, prompt, func(l limit) {
+			events <- event{rootAgent, map[string]any{"sessionUpdate": rateLimited, "until": l.until}}
 		})
 		if err == nil {
 			switch stop, _ := result["stopReason"].(string); stop {
@@ -334,7 +334,11 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 			for len(events) > 0 {
 				out.event(<-events)
 			}
-			if err != nil {
+			if l, limited := limitOf(err, time.Now()); limited && !l.rate {
+				out.line(iconError + " Devin's usage quota is used up: " + l.message)
+			} else if limited {
+				out.line(iconError + " Devin is still rate limited; giving up: " + l.message)
+			} else if err != nil {
 				out.line(iconError + " Devin did not finish: " + err.Error())
 			}
 			out.summary(time.Since(start))
@@ -582,6 +586,11 @@ func (o *reply) event(e event) {
 	case stopAsked:
 		o.line(iconStop + " Asked to stop and report")
 		return
+	case rateLimited:
+		until, _ := update["until"].(time.Time)
+		o.line(fmt.Sprintf("%s Rate limited by Devin; waiting until %s (%s), then going on",
+			iconWait, until.Local().Format("15:04"), time.Until(until).Round(time.Second)))
+		return
 	}
 	if kind == steered {
 		message, _ := update["message"].(string)
@@ -640,6 +649,7 @@ const (
 	iconDenied   = "\uebc2" // cod-workspace_untrusted
 	iconStop     = "\uead7" // cod-debug_stop
 	iconSummary  = "\ueab3" // cod-checklist
+	iconWait     = "\ueb7c" // cod-watch
 )
 
 // toolIcon is the icon of a tool call's kind, as ACP names kinds.

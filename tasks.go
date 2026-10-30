@@ -207,6 +207,8 @@ const serveTools = `[{
 const (
 	steered   = "_steered"
 	stopAsked = "_stop_asked"
+	// rateLimited is the one handed when a turn waits out a rate limit.
+	rateLimited = "_rate_limited"
 )
 
 const stopMessage = "Stop now. Do not start anything new; finish or undo only what would otherwise leave files broken. Then reply with a report: what you did, what is left, and the state you are leaving things in."
