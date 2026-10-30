@@ -176,11 +176,13 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort
 		filepath.Join(cache, "claude-devin-acp", "reviewer"), filepath.Join(cache, "claude-devin-acp", "permissions.json"))
 	s.d.reviewer = s.rev
 	s.load()
+	s.d.loadLimit()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.complete)
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, serveTools, s.call) })
 	mux.Handle("/mcp/permissions", s.rev)
+	mux.HandleFunc("GET /limit", s.limit)
 	mux.HandleFunc("GET /status", s.status)
 	mux.HandleFunc("GET /status/{session}", s.statusOf)
 	log.Printf("serving Devin as a model on http://%s/v1", listen)

@@ -93,7 +93,11 @@ Limits: Devin retries a rate limit itself, and once its retries are spent it ans
 with an error saying when the limit lifts; `serve` then says so, waits until then, and has Devin
 go on (up to five times a turn), sessions told the same reset going on 30s apart. A limit lifting more than 20 minutes away (Devin then names the day: "at Oct 31 06:01 UTC") or
 a used-up daily quota is not waited out: the turn ends saying until when, and until then every new
-turn is answered the same at once, without Devin.
+turn is answered the same at once, without Devin. It is kept in
+`~/.cache/claude-devin-acp/limit.json` across restarts, and `GET /limit` says it.
+`claude-devin-acp wait-limit`, run by an OpenCode agent as a background shell once its Devin
+subagents have finished, has OpenCode compact that session (`OPENCODE_SESSION_ID`), waits until
+the limit lifts and a minute more, and exits, which OpenCode tells the agent so it goes on.
 
 Watching and steering: `/mcp` has `task_status` (the tasks running and finished in the last hour,
 each with the last thing it did), `peek_task` (a task's latest lines), `message_task` and

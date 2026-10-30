@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -130,6 +133,40 @@ func (d *devin) limitedUntil(now time.Time) (limit, bool) {
 	return limit{}, false
 }
 
+// keptLimit is a long rate limit as it is kept on disk, so a restart still knows it.
+type keptLimit struct {
+	Until   time.Time `json:"until"`
+	Message string    `json:"message"`
+}
+
+func limitStore() string {
+	cache, _ := os.UserCacheDir()
+	return filepath.Join(cache, "claude-devin-acp", "limit.json")
+}
+
+func (d *devin) keepLimit(l limit) {
+	raw, _ := json.Marshal(keptLimit{l.until, l.message})
+	if err := os.WriteFile(limitStore(), raw, 0o644); err != nil {
+		log.Printf("keeping the rate limit: %v", err)
+	}
+}
+
+// loadLimit reads the long rate limit a previous run kept, if it has not lifted.
+func (d *devin) loadLimit() {
+	raw, err := os.ReadFile(limitStore())
+	if err != nil {
+		return
+	}
+	var kept keptLimit
+	if json.Unmarshal(raw, &kept) != nil || time.Now().After(kept.Until) {
+		return
+	}
+	d.mu.Lock()
+	d.longLimit = limit{rate: true, until: kept.Until, message: kept.Message}
+	d.mu.Unlock()
+	log.Printf("Devin is rate limited until %s, as kept from before", kept.Until.Local().Format("Jan 2 15:04"))
+}
+
 // limitWaits is how many rate limits in a row one turn waits out before giving up.
 const limitWaits = 5
 
@@ -149,6 +186,7 @@ func (d *devin) prompt(ctx context.Context, session, text string, waiting func(l
 			d.mu.Lock()
 			d.longLimit = l
 			d.mu.Unlock()
+			d.keepLimit(l)
 			log.Printf("Devin is rate limited until %s; not waiting that long", l.until.Local().Format("Jan 2 15:04"))
 		}
 		if !limited || l.long(now) || attempt == limitWaits {

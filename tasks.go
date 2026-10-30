@@ -307,6 +307,16 @@ func (s *server) steer(conversation *served, message string, said map[string]any
 	return nil
 }
 
+// limit is the rate limit too long to wait out within a turn that Devin is under, if any.
+func (s *server) limit(w http.ResponseWriter, _ *http.Request) {
+	state := map[string]any{"limited": false}
+	if l, limited := s.d.limitedUntil(time.Now()); limited {
+		state = map[string]any{"limited": true, "until": l.until, "message": l.message}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(state)
+}
+
 func (s *server) status(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.tasks(24 * time.Hour))
