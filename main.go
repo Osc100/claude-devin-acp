@@ -307,8 +307,9 @@ func (p *proxy) cwdOf(session string) string {
 // before. Taken away, Claude has `devin` alone to delegate with.
 var claudeSubagentTools = []string{"Agent", "Task"}
 
-const delegationPrompt = `Delegation in this session goes to Devin, a separate coding agent on this machine, through the ` +
-	"`mcp__devin__devin`" + ` tool; your own subagent tools are not available. Hand Devin any work you would have given a subagent — exploring a codebase, implementing, reviewing, running long tasks — as a complete, self-contained task, then check what it reports before relying on it. Do small, quick steps yourself.`
+const delegationPrompt = `Delegation in this session goes to Devin, a separate coding agent on this machine; your own subagent tools are not available. ` +
+	"`mcp__devin__devin`" + ` starts a Devin run in the background and returns its run id at once: hand Devin any work you would have given a subagent — exploring a codebase, implementing, reviewing, long tasks — as a complete, self-contained task, start independent runs side by side, and keep working meanwhile. Collect answers with ` +
+	"`mcp__devin__devin_wait`" + `, and before you end your turn wait for every run you started, unless the user asked you not to. Check what Devin reports before relying on it. Do small, quick steps yourself.`
 
 // delegateToDevin takes Claude's own subagent tools out of a session/new, session/load or
 // session/resume and appends to its system prompt that delegation goes to Devin. Both through the

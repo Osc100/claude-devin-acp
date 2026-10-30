@@ -6,28 +6,48 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 )
 
 // mcpServer is the MCP server Claude is handed in every session the editor opens, at
-// `/mcp/<token>`: the token says which of Claude's sessions a call comes from, so its Devin run
-// is announced under that session. Streamable HTTP's plain form: a request is POSTed and answered
-// with one JSON body; nothing is streamed, since the only tool answers once, when Devin is done.
+// `/mcp/<token>`: the token says which of Claude's sessions a call comes from, so its Devin runs
+// are announced under that session. Streamable HTTP's plain form: a request is POSTed and answered
+// with one JSON body. Nothing is streamed: a run is started at once and collected with
+// `devin_wait`, so no call has anything to say before its one answer.
 type mcpServer struct{ p *proxy }
 
-const devinTool = `{
+const devinTools = `[{
   "name": "devin",
-  "description": "Hand a task to Devin, a separate coding agent running on this machine, and wait for its answer. Devin works in the given directory with its own tools and may start subagents of its own; the editor shows its work as a subagent of this session. Give it a complete, self-contained task. To follow up on an earlier run, pass that run's id as continue.",
+  "description": "Start Devin, a separate coding agent on this machine, on a task in the background, and return its run id at once. Devin works with its own tools and may start subagents of its own; the editor shows its work as a subagent of this session. Give it a complete, self-contained task, keep working, and collect its answer with devin_wait. To follow up on a finished run, pass its run id as continue.",
   "inputSchema": {
     "type": "object",
     "properties": {
       "task": {"type": "string", "description": "What Devin should do, self-contained."},
       "title": {"type": "string", "description": "A short label for the run, shown in the editor."},
-      "cwd": {"type": "string", "description": "Absolute directory Devin works in. Defaults to the session's directory as Devin finds it."},
-      "continue": {"type": "string", "description": "The run id an earlier call returned, to give that Devin session a follow-up instead of starting a new one."}
+      "cwd": {"type": "string", "description": "Absolute directory Devin works in. Defaults to the session's directory."},
+      "continue": {"type": "string", "description": "The id of a finished run, to give that Devin session a follow-up instead of starting a new one."}
     },
     "required": ["task"]
   }
-}`
+}, {
+  "name": "devin_wait",
+  "description": "Wait for Devin runs to finish and return each one's status and, once finished, its answer. Waits for every named run (all of this session's runs if none are named) up to timeout_seconds; 0 only reports where they are.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {
+      "runs": {"type": "array", "items": {"type": "string"}, "description": "Run ids to wait for; all of this session's runs if left out."},
+      "timeout_seconds": {"type": "number", "description": "Longest to wait, in seconds. Default 600; 0 to only check."}
+    }
+  }
+}, {
+  "name": "devin_cancel",
+  "description": "Stop a Devin run's current turn.",
+  "inputSchema": {
+    "type": "object",
+    "properties": {"run": {"type": "string", "description": "The run id to stop."}},
+    "required": ["run"]
+  }
+}]`
 
 func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, found := strings.CutPrefix(r.URL.Path, "/mcp/")
@@ -78,7 +98,7 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "ping":
 		reply["result"] = map[string]any{}
 	case "tools/list":
-		reply["result"] = map[string]any{"tools": []json.RawMessage{json.RawMessage(devinTool)}}
+		reply["result"] = map[string]any{"tools": json.RawMessage(devinTools)}
 	case "tools/call":
 		// Looked up at the call, not at the connection: the session was still being opened then.
 		parent, _ = s.p.sessionOf(token)
@@ -91,34 +111,63 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *mcpServer) call(r *http.Request, parent string, params map[string]any) map[string]any {
-	if name, _ := params["name"].(string); name != "devin" {
-		return toolResult("no tool "+name, true)
-	}
-	if parent == "" {
-		return toolResult("the session is still being opened; call devin again", true)
-	}
+	name, _ := params["name"].(string)
 	args, _ := params["arguments"].(map[string]any)
-	task, _ := args["task"].(string)
-	if strings.TrimSpace(task) == "" {
-		return toolResult("task is required", true)
+	if parent == "" {
+		return toolResult("the session is still being opened; call "+name+" again", true)
 	}
-	title, _ := args["title"].(string)
-	cwd, _ := args["cwd"].(string)
-	cont, _ := args["continue"].(string)
-	// The request's context ends when Claude gives the call up, which cancels Devin's turn.
-	answer, runID, err := s.p.devin.do(r.Context(), parent, task, title, cwd, cont)
-	if err != nil {
-		log.Printf("Devin run for %s: %v", parent, err)
-		text := "Devin did not finish: " + err.Error()
-		if answer != "" {
-			text += "\n\nWhat it said before that:\n" + answer
+	switch name {
+	case "devin":
+		task, _ := args["task"].(string)
+		if strings.TrimSpace(task) == "" {
+			return toolResult("task is required", true)
 		}
-		return toolResult(text, true)
+		title, _ := args["title"].(string)
+		cwd, _ := args["cwd"].(string)
+		cont, _ := args["continue"].(string)
+		run, err := s.p.devin.begin(parent, task, title, cwd, cont)
+		if err != nil {
+			log.Printf("starting a Devin run for %s: %v", parent, err)
+			return toolResult("Devin did not start: "+err.Error(), true)
+		}
+		return toolResult("Devin is working on it in the background as run "+run.child+
+			". Keep working; collect its answer with devin_wait.", false)
+	case "devin_wait":
+		var ids []string
+		if listed, ok := args["runs"].([]any); ok {
+			for _, id := range listed {
+				if id, ok := id.(string); ok {
+					ids = append(ids, id)
+				}
+			}
+		}
+		timeout := 600.0
+		if seconds, ok := args["timeout_seconds"].(float64); ok && seconds >= 0 {
+			timeout = seconds
+		}
+		runs, err := s.p.runsOf(parent, ids)
+		if err != nil {
+			return toolResult(err.Error(), true)
+		}
+		if len(runs) == 0 {
+			return toolResult("no Devin runs in this session", false)
+		}
+		wait(r.Context(), runs, time.Duration(timeout*float64(time.Second)))
+		reports := make([]string, len(runs))
+		for i, run := range runs {
+			reports[i] = run.report()
+		}
+		return toolResult(strings.Join(reports, "\n\n"), false)
+	case "devin_cancel":
+		id, _ := args["run"].(string)
+		runs, err := s.p.runsOf(parent, []string{id})
+		if err != nil {
+			return toolResult(err.Error(), true)
+		}
+		s.p.cancelChild(runs[0].child)
+		return toolResult("asked Devin to stop run "+id+"; devin_wait reports when it has", false)
 	}
-	if answer == "" {
-		answer = "(Devin finished without a message.)"
-	}
-	return toolResult(answer+"\n\n[Devin run id: "+runID+" — pass it as continue to follow up.]", false)
+	return toolResult("no tool "+name, true)
 }
 
 func toolResult(text string, isError bool) map[string]any {

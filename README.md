@@ -4,8 +4,11 @@ Claude, with the local Devin CLI as its subagent, as one ACP agent for an editor
 `--devin-only`, Devin on its own, with its subagents shown as children ("Devin + Devin").
 
 The editor starts this proxy in place of the Claude adapter. Every message between the editor
-and Claude passes through unchanged. On top of that, every session Claude opens gets one more MCP
-tool, `devin`, which hands a task to `devin acp` and waits for its answer. The editor sees each
+and Claude passes through unchanged. On top of that, every session Claude opens gets MCP tools for
+Devin: `devin` starts a run of `devin acp` in the background and returns at once, `devin_wait`
+collects runs' answers (or only checks on them), `devin_cancel` stops one. Claude's own subagent
+tools are taken away and its system prompt says to delegate to Devin (`--claude-subagents` leaves
+them). The editor sees each
 Devin run as a subagent of Claude's session, with Devin's own subagents nested under it, through
 ACP's [subagents RFD](https://agentclientprotocol.com/rfds/subagents).
 
@@ -67,8 +70,10 @@ comes back. Devin's top agent passes through untouched, being the editor's own t
   no Stop button: Devin has a way to stop one subagent, but it has not been seen used.
 - **Permissions**: Devin's permission requests are asked in the thread of the agent whose tool
   call it is.
-- **Answer**: Claude gets Devin's final answer and a run id. Passing the run id as `continue`
-  sends a follow-up to the same Devin session.
+- **Answer**: `devin_wait` gives Claude each run's status and, once it is done, its final answer.
+  Passing a finished run's id to `devin` as `continue` sends a follow-up to the same Devin session.
+  An MCP server cannot wake Claude when a run ends, so Claude collects runs itself; its prompt
+  says to before it ends its turn.
 
 Not done: re-opening an old thread does not bring back the Devin cards (the RFD's replay on
 `session/load`).

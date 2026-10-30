@@ -10,8 +10,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Devin's dialect, as its CLI 3000.11.234 speaks it (captured 2026-10-30):
@@ -65,11 +67,19 @@ type run struct {
 	parent, child, devinSession string
 	shown                       bool
 
-	mu      sync.Mutex
-	agents  map[string]string // Devin's agent id → the editor's session id for it
-	answer  strings.Builder   // what Devin's top agent said this turn, which goes back to Claude
-	broken  bool              // whether Devin did something else since `answer` last grew
-	prompts int
+	mu     sync.Mutex
+	agents map[string]string // Devin's agent id → the editor's session id for it
+	answer strings.Builder   // what Devin's top agent said this turn, which goes back to Claude
+	broken bool              // whether Devin did something else since `answer` last grew
+	title  string            // the label of its latest turn
+
+	// Its latest turn: done is closed when it ends, outcome and failure are then what it said
+	// and what went wrong.
+	done     chan struct{}
+	finished bool
+	outcome  string
+	failure  error
+	prompts  int
 }
 
 func (r *run) sessionOf(agent string) string {
@@ -346,12 +356,13 @@ func (d *devin) askPermission(msg map[string]any) {
 	d.reply(reply)
 }
 
-// do hands Devin a task in the run `cont` names, or in a new session, and waits for its turn to
-// end. Whatever cancels ctx — Claude's call given up, its session cancelled — cancels Devin's
-// turn too.
-func (d *devin) do(ctx context.Context, parent, task, title, cwd, cont string) (string, string, error) {
+// begin hands Devin a task in the run `cont` names, or in a new session, and returns the run at
+// once: Devin works in the background, its card running, and the run's turn is collected with
+// wait. Claude is never held on a call while Devin works, as Claude Code's own background agents
+// do not hold it.
+func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
 	if err := d.start(); err != nil {
-		return "", "", err
+		return nil, err
 	}
 	var r *run
 	if cont != "" {
@@ -359,7 +370,7 @@ func (d *devin) do(ctx context.Context, parent, task, title, cwd, cont string) (
 		r = d.p.children[cont]
 		d.p.mu.Unlock()
 		if r == nil || r.parent != parent {
-			return "", "", fmt.Errorf("no Devin run %q in this session to continue", cont)
+			return nil, fmt.Errorf("no Devin run %q in this session to continue", cont)
 		}
 	} else {
 		if cwd == "" {
@@ -367,11 +378,11 @@ func (d *devin) do(ctx context.Context, parent, task, title, cwd, cont string) (
 		}
 		result, err := d.request("session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}})
 		if err != nil {
-			return "", "", err
+			return nil, err
 		}
 		devinSession, _ := result["sessionId"].(string)
 		if devinSession == "" {
-			return "", "", errors.New("Devin opened no session")
+			return nil, errors.New("Devin opened no session")
 		}
 		r = &run{parent: parent, child: "devin:" + devinSession, devinSession: devinSession,
 			shown: d.p.showsSubagents(), agents: map[string]string{rootAgent: "devin:" + devinSession}}
@@ -383,53 +394,122 @@ func (d *devin) do(ctx context.Context, parent, task, title, cwd, cont string) (
 		d.p.mu.Unlock()
 	}
 	r.mu.Lock()
+	if r.done != nil && !r.finished {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("Devin run %s is still working; wait for it before following up", r.child)
+	}
 	r.answer.Reset()
+	r.broken, r.finished, r.outcome, r.failure = false, false, "", nil
+	r.done = make(chan struct{})
 	r.prompts++
 	message := fmt.Sprintf("%s:prompt:%d", r.child, r.prompts)
+	r.title = title
+	if r.title == "" {
+		r.title = firstLine(task)
+	}
 	r.mu.Unlock()
 	if r.shown {
-		if title == "" {
-			title = firstLine(task)
-		}
-		d.p.announce(parent, r.child, "Devin: "+title, "Devin CLI", true, task, message)
+		d.p.announce(parent, r.child, "Devin: "+r.title, "Devin CLI", true, task, message)
 	}
+	go d.turn(r, task)
+	return r, nil
+}
 
-	done := make(chan error, 1)
-	var stop string
-	go func() {
-		result, err := d.request("session/prompt", map[string]any{
-			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": task}},
-		})
-		stop, _ = result["stopReason"].(string)
-		done <- err
-	}()
-	var err error
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
-		err = <-done
+// turn is one of Devin's turns in r, from the prompt to its end: the card's end, and the outcome
+// wait hands Claude.
+func (d *devin) turn(r *run, task string) {
+	result, err := d.request("session/prompt", map[string]any{
+		"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": task}},
+	})
+	stop, _ := result["stopReason"].(string)
+	if err == nil && stop == "cancelled" {
+		err = errors.New("Devin's turn was cancelled")
 	}
-	r.mu.Lock()
-	answer := strings.TrimSpace(r.answer.String())
-	r.mu.Unlock()
 	if r.shown {
 		switch {
+		case stop == "cancelled":
+			d.p.state(r.parent, r.child, idle("cancelled", ""))
 		case err != nil:
-			d.p.state(parent, r.child, idle("error", err.Error()))
+			d.p.state(r.parent, r.child, idle("error", err.Error()))
 		case stop == "":
-			d.p.state(parent, r.child, idle("end_turn", ""))
+			d.p.state(r.parent, r.child, idle("end_turn", ""))
 		default:
-			d.p.state(parent, r.child, idle(stop, ""))
+			d.p.state(r.parent, r.child, idle(stop, ""))
 		}
 	}
-	if err != nil {
-		return answer, r.child, err
+	r.mu.Lock()
+	r.outcome = strings.TrimSpace(r.answer.String())
+	r.failure = err
+	r.finished = true
+	close(r.done)
+	r.mu.Unlock()
+}
+
+// report is what wait says of a run: its id and title, and its answer once its turn is over.
+func (r *run) report() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	head := fmt.Sprintf("## %s (%s)", r.child, r.title)
+	switch {
+	case r.done == nil:
+		return head + ": never started"
+	case !r.finished:
+		return head + ": still working"
+	case r.failure != nil:
+		text := head + ": did not finish: " + r.failure.Error()
+		if r.outcome != "" {
+			text += "\n\nWhat it said before that:\n" + r.outcome
+		}
+		return text
+	case r.outcome == "":
+		return head + ": finished, without a message"
+	default:
+		return head + ": finished\n\n" + r.outcome
 	}
-	if stop == "cancelled" {
-		return answer, r.child, errors.New("Devin's turn was cancelled")
+}
+
+// runsOf are the runs of a Claude session that ids name, or all of them with none named.
+func (p *proxy) runsOf(parent string, ids []string) ([]*run, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var runs []*run
+	if len(ids) == 0 {
+		for _, r := range p.children {
+			if r.parent == parent {
+				runs = append(runs, r)
+			}
+		}
+		sort.Slice(runs, func(i, j int) bool { return runs[i].child < runs[j].child })
+		return runs, nil
 	}
-	return answer, r.child, nil
+	for _, id := range ids {
+		r := p.children[id]
+		if r == nil || r.parent != parent {
+			return nil, fmt.Errorf("no Devin run %q in this session", id)
+		}
+		runs = append(runs, r)
+	}
+	return runs, nil
+}
+
+// wait holds until every run is done, ctx ends or the timeout passes, whichever is first.
+func wait(ctx context.Context, runs []*run, timeout time.Duration) {
+	deadline := time.After(timeout)
+	for _, r := range runs {
+		r.mu.Lock()
+		done := r.done
+		r.mu.Unlock()
+		if done == nil {
+			continue
+		}
+		select {
+		case <-done:
+		case <-deadline:
+			return
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 // cancelChild stops the Devin run the editor's child session is, and says whether the session was
