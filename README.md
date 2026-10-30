@@ -72,7 +72,10 @@ SWE-2 at medium, open while any other session is in a turn, which is handed the 
 asking session's task and answers through `decide_permission`, the one tool of an MCP server at
 `/mcp/permissions`. Any other request of its own is refused. Its decisions are kept in
 `~/.cache/claude-devin-acp/permissions.json`, and the exact same tool call in the same directory is
-decided again from there; a denied session is told why.
+decided again from there; a denied session is told why. A shell command that only reads (each part
+a known reader such as `tail`, `rg`, `ls`, `git log` or `sed -n '1,9p'`, with no redirect but to
+`/dev/null` and no command substitution) is allowed without asking. Only the reviewer's own
+decisions and denials are shown.
 
 Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
 `--devin-effort` (high) by default, the model `swe-2-medium`, `swe-2-high` or `swe-2-max` (Devin's

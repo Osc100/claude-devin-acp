@@ -566,6 +566,13 @@ func (d *devin) askPermission(msg map[string]any) {
 	meta, _ := call["_meta"].(map[string]any)
 	if v := d.reviewer; d.p.editor == nil && v != nil {
 		if !v.is(devinSession) {
+			if readOnly(call) {
+				// Only reads: allowed without asking, and without a word to anyone.
+				options, _ := params["options"].([]any)
+				reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": chosen(options, true)}}
+				d.reply(reply)
+				return
+			}
 			d.reviewed(msg["id"], r, params, call, v.review(r, call))
 			return
 		}
@@ -628,6 +635,9 @@ func (d *devin) reviewed(id any, r *run, params, call map[string]any, v verdict)
 	watch, cwd := r.watch, r.cwd
 	r.mu.Unlock()
 	title := toolTitle(call, meta, cwd)
+	if v.allow && v.remembered {
+		return // allowed before, and said then
+	}
 	log.Printf("permission for %s in %s: allowed %v (%s)", title, r.devinSession, v.allow, v.reason)
 	if watch != nil {
 		watch(ownerOf(meta), map[string]any{"sessionUpdate": permissionReviewed, "title": title,
