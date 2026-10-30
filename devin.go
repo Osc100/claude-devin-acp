@@ -33,6 +33,9 @@ const (
 	metaStarted   = "cognition.ai/subagent_started"
 	metaCompleted = "cognition.ai/subagent_completed"
 	rootAgent     = "root"
+	// permissionRefused is the update a run's watcher is handed for a permission Devin asked
+	// for with no editor to ask: not one of Devin's own.
+	permissionRefused = "_permission_refused"
 )
 
 // forwarded are the updates of a Devin session that make sense in a child's transcript. Its mode,
@@ -72,6 +75,9 @@ type run struct {
 	answer strings.Builder   // what Devin's top agent said this turn, which goes back to Claude
 	broken bool              // whether Devin did something else since `answer` last grew
 	title  string            // the label of its latest turn
+	// watch, when set, is handed every update of the run with the agent it belongs to, before
+	// anything else is done with it: how `serve` streams a run to a client that is no editor.
+	watch func(owner string, update map[string]any)
 
 	// Its latest turn: done is closed when it ends, outcome and failure are then what it said
 	// and what went wrong.
@@ -264,6 +270,12 @@ func (d *devin) update(params map[string]any, r *run) {
 	}
 	meta, _ := update["_meta"].(map[string]any)
 	owner := ownerOf(meta)
+	r.mu.Lock()
+	watch := r.watch
+	r.mu.Unlock()
+	if watch != nil {
+		watch(owner, update)
+	}
 	if started, _ := meta[metaStarted].(map[string]any); started != nil {
 		agent, _ := started["agentId"].(string)
 		title, _ := started["title"].(string)
@@ -342,6 +354,19 @@ func (d *devin) askPermission(msg map[string]any) {
 	}
 	call, _ := params["toolCall"].(map[string]any)
 	meta, _ := call["_meta"].(map[string]any)
+	if d.p.editor == nil {
+		// No editor, so nobody to ask (`serve`): refused, and the run's watcher is told.
+		reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}
+		d.reply(reply)
+		r.mu.Lock()
+		watch := r.watch
+		r.mu.Unlock()
+		if watch != nil {
+			title, _ := call["title"].(string)
+			watch(ownerOf(meta), map[string]any{"sessionUpdate": permissionRefused, "title": title})
+		}
+		return
+	}
 	target := r.parent
 	if r.shown {
 		target = r.sessionOf(ownerOf(meta))

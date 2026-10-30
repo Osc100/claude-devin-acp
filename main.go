@@ -37,12 +37,17 @@ func main() {
 	claudeCmd := flag.String("claude", envOr("CLAUDE_DEVIN_CLAUDE", defaultClaude), "command that starts the Claude ACP adapter")
 	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin acp"), "command that starts Devin as an ACP agent")
 	devinOnly := flag.Bool("devin-only", false, "Devin + Devin: the editor talks to Devin itself, its subagents shown as children")
+	serve := flag.String("serve", "", "Devin as a model: serve an OpenAI-compatible chat endpoint on this address (e.g. 127.0.0.1:47821)")
 	claudeSubagents := flag.Bool("claude-subagents", false, "leave Claude its own subagents beside Devin (by default every delegation goes to Devin)")
 	flag.Parse()
 	log.SetPrefix("claude-devin-acp: ")
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *devinOnly {
 		runSolo(strings.Fields(*devinCmd))
+		return
+	}
+	if *serve != "" {
+		runServe(*serve, strings.Fields(*devinCmd))
 		return
 	}
 
