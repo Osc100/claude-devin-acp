@@ -45,6 +45,9 @@ var workingDirectory = regexp.MustCompile(`(?m)^\s*Working directory: (.+?)\s*$`
 type server struct {
 	d   *devin
 	cwd string
+	// store is where the conversations are kept, so that a restart of the server still knows
+	// which Devin session each is, and loads it again.
+	store string
 
 	mu       sync.Mutex
 	sessions map[string]*served // a conversation's key → the Devin session it is
@@ -58,11 +61,65 @@ type served struct {
 	busy  bool
 }
 
-func runServe(listen string, devinArgs []string) {
+// kept is a conversation as the store keeps it.
+type kept struct {
+	Session string `json:"session"`
+	Cwd     string `json:"cwd"`
+	Users   int    `json:"users"`
+}
+
+// load reads the conversations a previous run of the server kept. Their sessions are loaded
+// into Devin again on their next turn.
+func (s *server) load() {
+	raw, err := os.ReadFile(s.store)
+	if err != nil {
+		return
+	}
+	var stored map[string]kept
+	if err := json.Unmarshal(raw, &stored); err != nil {
+		log.Printf("reading %s: %v", s.store, err)
+		return
+	}
+	for key, k := range stored {
+		r := &run{child: "devin:" + k.Session, devinSession: k.Session, cwd: k.Cwd,
+			agents: map[string]string{rootAgent: "devin:" + k.Session}}
+		s.d.runs[k.Session] = r
+		s.sessions[key] = &served{r: r, users: k.Users}
+	}
+	log.Printf("kept %d conversations from before", len(stored))
+}
+
+// save writes the conversations down, through a temporary file so a write cut short leaves the
+// last one whole. Called with s.mu held.
+func (s *server) save() {
+	stored := make(map[string]kept, len(s.sessions))
+	for key, conversation := range s.sessions {
+		stored[key] = kept{Session: conversation.r.devinSession, Cwd: conversation.r.cwd, Users: conversation.users}
+	}
+	raw, _ := json.Marshal(stored)
+	if err := os.MkdirAll(filepath.Dir(s.store), 0o755); err != nil {
+		log.Printf("keeping conversations: %v", err)
+		return
+	}
+	tmp := s.store + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		log.Printf("keeping conversations: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, s.store); err != nil {
+		log.Printf("keeping conversations: %v", err)
+	}
+}
+
+func runServe(listen string, devinArgs []string, idleAfter time.Duration) {
 	cwd, _ := os.Getwd()
+	cache, _ := os.UserCacheDir()
 	p := &proxy{children: map[string]*run{}, waiting: map[string]chan map[string]any{}}
-	s := &server{d: newDevin(devinArgs, p), cwd: cwd, sessions: map[string]*served{}}
+	s := &server{d: newDevin(devinArgs, p), cwd: cwd, sessions: map[string]*served{},
+		store: filepath.Join(cache, "claude-devin-acp", "conversations.json")}
+	s.d.idleAfter = idleAfter
 	p.devin = s.d
+	s.load()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.complete)
@@ -157,6 +214,13 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	}()
 
 	done := make(chan error, 1)
+	s.d.busy()
+	defer s.d.rested()
+	if err := s.d.open(r); err != nil {
+		out.line("✗ " + err.Error())
+		out.finish()
+		return
+	}
 	go func() {
 		result, err := s.d.request("session/prompt", map[string]any{
 			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": prompt}},
@@ -227,7 +291,7 @@ func (s *server) turn(cwd string, users []string) (*served, string, error) {
 		if devinSession == "" {
 			return nil, "", errors.New("Devin opened no session")
 		}
-		r := &run{child: "devin:" + devinSession, devinSession: devinSession,
+		r := &run{child: "devin:" + devinSession, devinSession: devinSession, cwd: cwd, loaded: true,
 			agents: map[string]string{rootAgent: "devin:" + devinSession}}
 		s.d.mu.Lock()
 		s.d.runs[devinSession] = r
@@ -244,6 +308,7 @@ func (s *server) turn(cwd string, users []string) (*served, string, error) {
 	}
 	s.mu.Lock()
 	conversation.users = len(users)
+	s.save()
 	s.mu.Unlock()
 	return conversation, prompt, nil
 }

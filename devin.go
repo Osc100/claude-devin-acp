@@ -58,6 +58,74 @@ type devin struct {
 	pending map[string]chan map[string]any
 	nextID  int
 	runs    map[string]*run // Devin's session id → the run in it
+
+	// idleAfter is how long Devin is kept with no turn running before it is stopped, nought to
+	// keep it: a Devin process with a session open holds about 130 MB. A run's session outlives
+	// it, saved by Devin, and is loaded again before the run's next turn (`open`).
+	idleAfter time.Duration
+	proc      *os.Process
+	turns     int // turns running now
+	idle      *time.Timer
+}
+
+// busy notes a turn starting: Devin is not stopped while any runs.
+func (d *devin) busy() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.turns++
+	if d.idle != nil {
+		d.idle.Stop()
+		d.idle = nil
+	}
+}
+
+// rested notes a turn ending, and when it was the last, stops Devin once idleAfter passes
+// with no other.
+func (d *devin) rested() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.turns--
+	if d.turns > 0 || d.idleAfter <= 0 || d.proc == nil {
+		return
+	}
+	d.idle = time.AfterFunc(d.idleAfter, func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.turns == 0 && d.proc != nil {
+			log.Printf("Devin idle for %v; stopping it until the next turn", d.idleAfter)
+			_ = d.proc.Kill()
+		}
+	})
+}
+
+// open has Devin running and holding r's session: loaded again if this Devin process has not
+// opened it, as after an idle stop or a restart. What Devin replays of the session while it
+// loads is history the client has, and is passed on to nobody.
+func (d *devin) open(r *run) error {
+	if err := d.start(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	loaded := r.loaded
+	r.mu.Unlock()
+	if loaded {
+		return nil
+	}
+	r.mu.Lock()
+	r.replaying = true
+	r.mu.Unlock()
+	_, err := d.request("session/load", map[string]any{
+		"sessionId": r.devinSession, "cwd": r.cwd, "mcpServers": []any{},
+	})
+	r.mu.Lock()
+	r.replaying = false
+	r.loaded = err == nil
+	r.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("reopening Devin session %s: %w", r.devinSession, err)
+	}
+	log.Printf("reopened Devin session %s", r.devinSession)
+	return nil
 }
 
 func newDevin(args []string, p *proxy) *devin {
@@ -78,6 +146,11 @@ type run struct {
 	// watch, when set, is handed every update of the run with the agent it belongs to, before
 	// anything else is done with it: how `serve` streams a run to a client that is no editor.
 	watch func(owner string, update map[string]any)
+	// cwd is the directory its session was opened in, which loading it again names.
+	cwd string
+	// loaded is whether the running Devin process holds its session; replaying, whether it is
+	// replaying it as it loads, when nothing it says is new.
+	loaded, replaying bool
 
 	// Its latest turn: done is closed when it ends, outcome and failure are then what it said
 	// and what went wrong.
@@ -128,12 +201,18 @@ func (d *devin) start() error {
 		return fail(fmt.Errorf("starting Devin (%s): %w", strings.Join(d.args, " "), err))
 	}
 	d.in = &wire{w: stdin}
+	d.proc = cmd.Process
 	d.mu.Unlock()
 	go func() {
 		d.p.pump(stdout, d.fromDevin)
 		_ = cmd.Wait()
 		d.mu.Lock()
-		d.ready, d.in = nil, nil
+		d.ready, d.in, d.proc = nil, nil, nil
+		for _, r := range d.runs {
+			r.mu.Lock()
+			r.loaded = false
+			r.mu.Unlock()
+		}
 		for id, answer := range d.pending {
 			answer <- map[string]any{"error": map[string]any{"message": "Devin exited"}}
 			delete(d.pending, id)
@@ -271,8 +350,11 @@ func (d *devin) update(params map[string]any, r *run) {
 	meta, _ := update["_meta"].(map[string]any)
 	owner := ownerOf(meta)
 	r.mu.Lock()
-	watch := r.watch
+	watch, replaying := r.watch, r.replaying
 	r.mu.Unlock()
+	if replaying {
+		return
+	}
 	if watch != nil {
 		watch(owner, update)
 	}
@@ -397,6 +479,9 @@ func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
 		if r == nil || r.parent != parent {
 			return nil, fmt.Errorf("no Devin run %q in this session to continue", cont)
 		}
+		if err := d.open(r); err != nil {
+			return nil, err
+		}
 	} else {
 		if cwd == "" {
 			cwd = d.p.cwdOf(parent)
@@ -409,8 +494,8 @@ func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
 		if devinSession == "" {
 			return nil, errors.New("Devin opened no session")
 		}
-		r = &run{parent: parent, child: "devin:" + devinSession, devinSession: devinSession,
-			shown: d.p.showsSubagents(), agents: map[string]string{rootAgent: "devin:" + devinSession}}
+		r = &run{parent: parent, child: "devin:" + devinSession, devinSession: devinSession, cwd: cwd,
+			loaded: true, shown: d.p.showsSubagents(), agents: map[string]string{rootAgent: "devin:" + devinSession}}
 		d.mu.Lock()
 		d.runs[devinSession] = r
 		d.mu.Unlock()
@@ -443,6 +528,8 @@ func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
 // turn is one of Devin's turns in r, from the prompt to its end: the card's end, and the outcome
 // wait hands Claude.
 func (d *devin) turn(r *run, task string) {
+	d.busy()
+	defer d.rested()
 	result, err := d.request("session/prompt", map[string]any{
 		"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": task}},
 	})

@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 func main() {
@@ -38,6 +39,7 @@ func main() {
 	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin acp"), "command that starts Devin as an ACP agent")
 	devinOnly := flag.Bool("devin-only", false, "Devin + Devin: the editor talks to Devin itself, its subagents shown as children")
 	serve := flag.String("serve", "", "Devin as a model: serve an OpenAI-compatible chat endpoint on this address (e.g. 127.0.0.1:47821)")
+	devinIdle := flag.Duration("devin-idle", 10*time.Minute, "stop Devin after this long with no turn running (0 keeps it); its sessions are loaded again on the next turn")
 	claudeSubagents := flag.Bool("claude-subagents", false, "leave Claude its own subagents beside Devin (by default every delegation goes to Devin)")
 	flag.Parse()
 	log.SetPrefix("claude-devin-acp: ")
@@ -47,7 +49,7 @@ func main() {
 		return
 	}
 	if *serve != "" {
-		runServe(*serve, strings.Fields(*devinCmd))
+		runServe(*serve, strings.Fields(*devinCmd), *devinIdle)
 		return
 	}
 
@@ -82,6 +84,7 @@ func main() {
 		devinOnlyDelegate: !*claudeSubagents,
 	}
 	p.devin = newDevin(strings.Fields(*devinCmd), p)
+	p.devin.idleAfter = *devinIdle
 	go func() { log.Fatal(http.Serve(listener, &mcpServer{p: p})) }()
 	go func() {
 		p.pump(fromClaude, p.fromClaude)
