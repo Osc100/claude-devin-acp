@@ -157,3 +157,18 @@ func TestATaskOverTheLimitIsToldToWait(t *testing.T) {
 		t.Error("the refused task was started")
 	}
 }
+
+// Sessions told the same reset time go on 15s apart, and one waiting later is not held back.
+func TestRateLimitedSessionsGoOnApart(t *testing.T) {
+	d := newDevin(nil, nil)
+	reset := time.Date(2026, 10, 30, 6, 45, 0, 0, time.UTC)
+	for i := range 5 {
+		if got, want := d.resumeSlot(reset), reset.Add(time.Duration(i)*resumeSpacing); !got.Equal(want) {
+			t.Errorf("session %d goes on at %v, want %v", i, got, want)
+		}
+	}
+	later := reset.Add(10 * time.Minute)
+	if got := d.resumeSlot(later); !got.Equal(later) {
+		t.Errorf("a later limit is held to %v", got)
+	}
+}

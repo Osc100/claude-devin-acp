@@ -74,6 +74,22 @@ func limitOf(err error, now time.Time) (limit, bool) {
 // one was waited out (1m, then 2m, 3m…).
 const limitMargin = time.Minute
 
+// resumeSpacing is how far apart sessions waiting out a rate limit go on: they are all told the
+// same reset time, and going on at once would meet the limit again at once.
+const resumeSpacing = 15 * time.Second
+
+// resumeSlot is when a session waiting out a rate limit until at goes on: at, or resumeSpacing
+// after the session that goes on last, whichever is later.
+func (d *devin) resumeSlot(at time.Time) time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if earliest := d.lastResume.Add(resumeSpacing); at.Before(earliest) {
+		at = earliest
+	}
+	d.lastResume = at
+	return at
+}
+
 // limitWaits is how many rate limits in a row one turn waits out before giving up.
 const limitWaits = 5
 
@@ -91,7 +107,7 @@ func (d *devin) prompt(ctx context.Context, session, text string, waiting func(l
 		if !limited || !l.rate || attempt == limitWaits {
 			return result, err
 		}
-		l.until = l.until.Add(limitMargin * time.Duration(attempt+1))
+		l.until = d.resumeSlot(l.until.Add(limitMargin * time.Duration(attempt+1)))
 		log.Printf("Devin session %s is rate limited; waiting until %s", session, l.until.Local().Format("15:04:05"))
 		if waiting != nil {
 			waiting(l)
