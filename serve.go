@@ -257,6 +257,14 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 		sum := sha256.Sum256([]byte(cwd + "\x00" + users[0]))
 		key = hex.EncodeToString(sum[:])
 	}
+	if l, limited := s.d.limitedUntil(time.Now()); limited {
+		// Devin would refuse it at once; said without asking it, and the turn left untaken.
+		log.Printf("turn in %s answered with Devin's rate limit, until %s", cwd, l.until.Local().Format("Jan 2 15:04"))
+		out := newReply(w, chat.Stream)
+		out.line(iconWait + " " + l.Say(time.Now()))
+		out.finish()
+		return
+	}
 	conversation, prompt, err := s.turn(key, cwd, users)
 	var noRoom *full
 	if errors.As(err, &noRoom) {
@@ -361,8 +369,8 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 			for len(events) > 0 {
 				out.event(<-events)
 			}
-			if l, limited := limitOf(err, time.Now()); limited && !l.rate {
-				out.line(iconError + " Devin's usage quota is used up: " + l.message)
+			if l, limited := limitOf(err, time.Now()); limited && l.long(time.Now()) {
+				out.line(iconWait + " " + l.Say(time.Now()))
 			} else if limited {
 				out.line(iconError + " Devin is still rate limited; giving up: " + l.message)
 			} else if err != nil {

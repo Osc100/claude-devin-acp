@@ -75,6 +75,9 @@ type devin struct {
 	proc   *os.Process
 	turns  int // turns running now
 	idle   *time.Timer
+	// longLimit is the last rate limit too long to wait out, which new turns are answered with
+	// until it lifts.
+	longLimit limit
 	// lastResume is when the last session waiting out a rate limit is to go on (`resumeSlot`).
 	lastResume time.Time
 	// reviewer, when set, decides the permissions Devin asks for with no editor to ask (`serve`).

@@ -18,6 +18,10 @@ import (
 //	Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different
 //	model. Your limit will reset in 2 minutes (at 06:44 UTC).
 //
+// A longer one names the day too: "Your limit will reset in 6 hours 6 minutes (at Oct 31 06:01
+// UTC)." That is not waited out within a turn: the turn ends saying so, and until it lifts every
+// new turn is answered the same at once, without Devin.
+//
 // The daily quota says "Quota exhausted: Your daily usage quota has been exhausted. …", and lifts
 // only the next day or with more usage bought, so it is reported, not waited out.
 
@@ -32,7 +36,10 @@ func (e *acpError) Error() string {
 	return fmt.Sprintf("Devin refused %s: %s", e.method, e.message)
 }
 
-var resetsAt = regexp.MustCompile(`\(at (\d{1,2}):(\d{2}) UTC\)`)
+var resetsAt = regexp.MustCompile(`\(at (?:([A-Z][a-z]{2}) (\d{1,2}) )?(\d{1,2}):(\d{2}) UTC\)`)
+
+// longestWait is the longest rate limit waited out within a turn.
+const longestWait = 20 * time.Minute
 
 // limit is a usage limit a turn ran into: a rate limit, lifting at until, or the quota.
 type limit struct {
@@ -53,11 +60,18 @@ func limitOf(err error, now time.Time) (limit, bool) {
 	case strings.Contains(lower, "rate limit"):
 		l := limit{rate: true, until: now.Add(time.Minute), message: message}
 		if found := resetsAt.FindStringSubmatch(message); found != nil {
-			hour, _ := strconv.Atoi(found[1])
-			minute, _ := strconv.Atoi(found[2])
+			hour, _ := strconv.Atoi(found[3])
+			minute, _ := strconv.Atoi(found[4])
 			utc := now.UTC()
 			at := time.Date(utc.Year(), utc.Month(), utc.Day(), hour, minute, 0, 0, time.UTC)
-			if at.Before(utc.Add(-time.Hour)) {
+			if found[1] != "" {
+				// A day named: that day this year, or next year's once this year's is past.
+				day, _ := time.Parse("Jan 2 2006", fmt.Sprintf("%s %s %d", found[1], found[2], utc.Year()))
+				at = time.Date(day.Year(), day.Month(), day.Day(), hour, minute, 0, 0, time.UTC)
+				if at.Before(utc.AddDate(0, 0, -1)) {
+					at = at.AddDate(1, 0, 0)
+				}
+			} else if at.Before(utc.Add(-time.Hour)) {
 				at = at.AddDate(0, 0, 1) // past midnight UTC
 			}
 			l.until = at
@@ -90,6 +104,32 @@ func (d *devin) resumeSlot(at time.Time) time.Time {
 	return at
 }
 
+// long is whether a limit is one not waited out within a turn: the quota, or a rate limit lifting
+// more than longestWait from now.
+func (l limit) long(now time.Time) bool {
+	return !l.rate || l.until.Sub(now) > longestWait
+}
+
+// Say is a limit as a turn's last line says it.
+func (l limit) Say(now time.Time) string {
+	if !l.rate {
+		return "Devin's usage quota is used up: " + l.message
+	}
+	return fmt.Sprintf("Devin is rate limited until %s (in %s), too long to wait within a turn; start this again then. %s",
+		l.until.Local().Format("Jan 2 15:04"), l.until.Sub(now).Round(time.Minute), l.message)
+}
+
+// limitedUntil is a long limit Devin is under, if it is under one now: what a new turn is answered
+// with, without Devin.
+func (d *devin) limitedUntil(now time.Time) (limit, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.longLimit.rate && now.Before(d.longLimit.until) {
+		return d.longLimit, true
+	}
+	return limit{}, false
+}
+
 // limitWaits is how many rate limits in a row one turn waits out before giving up.
 const limitWaits = 5
 
@@ -103,8 +143,15 @@ func (d *devin) prompt(ctx context.Context, session, text string, waiting func(l
 		result, err := d.request("session/prompt", map[string]any{
 			"sessionId": session, "prompt": []any{map[string]any{"type": "text", "text": text}},
 		})
-		l, limited := limitOf(err, time.Now())
-		if !limited || !l.rate || attempt == limitWaits {
+		now := time.Now()
+		l, limited := limitOf(err, now)
+		if limited && l.rate && l.long(now) {
+			d.mu.Lock()
+			d.longLimit = l
+			d.mu.Unlock()
+			log.Printf("Devin is rate limited until %s; not waiting that long", l.until.Local().Format("Jan 2 15:04"))
+		}
+		if !limited || l.long(now) || attempt == limitWaits {
 			return result, err
 		}
 		l.until = d.resumeSlot(l.until.Add(limitMargin * time.Duration(attempt+1)))

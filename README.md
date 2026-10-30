@@ -91,7 +91,9 @@ running and to start it again once one finishes.
 
 Limits: Devin retries a rate limit itself, and once its retries are spent it answers the turn
 with an error saying when the limit lifts; `serve` then says so, waits until then, and has Devin
-go on (up to five times a turn), sessions told the same reset going on 30s apart. A used-up daily quota is reported as that, not waited out.
+go on (up to five times a turn), sessions told the same reset going on 30s apart. A limit lifting more than 20 minutes away (Devin then names the day: "at Oct 31 06:01 UTC") or
+a used-up daily quota is not waited out: the turn ends saying until when, and until then every new
+turn is answered the same at once, without Devin.
 
 Watching and steering: `/mcp` has `task_status` (the tasks running and finished in the last hour,
 each with the last thing it did), `peek_task` (a task's latest lines), `message_task` and

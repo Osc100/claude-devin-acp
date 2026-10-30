@@ -127,6 +127,18 @@ func TestALimitIsReadOffDevinsError(t *testing.T) {
 	if l, _ := limitOf(late, time.Date(2026, 10, 30, 23, 59, 30, 0, time.UTC)); l.until.Day() != 31 {
 		t.Errorf("a reset past midnight is %v", l.until)
 	}
+	long := &acpError{message: "Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 6 hours 6 minutes (at Oct 31 06:01 UTC)."}
+	evening := time.Date(2026, 10, 30, 23, 55, 0, 0, time.UTC)
+	if l, ok := limitOf(long, evening); !ok || !l.rate || !l.until.Equal(time.Date(2026, 10, 31, 6, 1, 0, 0, time.UTC)) || !l.long(evening) {
+		t.Errorf("a dated limit read as %+v, %v", l, ok)
+	}
+	if l, _ := limitOf(rate, now); l.long(now) {
+		t.Error("a two-minute limit is too long to wait")
+	}
+	newYear := &acpError{message: "Reached free model rate limit. Your limit will reset in 3 hours (at Jan 1 02:00 UTC)."}
+	if l, _ := limitOf(newYear, time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC)); l.until.Year() != 2027 {
+		t.Errorf("a reset in the new year is %v", l.until)
+	}
 	quota := &acpError{message: "Quota exhausted: Your daily usage quota has been exhausted. Visit https://app.devin.ai/settings/usage to purchase on-demand usage or turn on auto-reload."}
 	if l, ok := limitOf(quota, now); !ok || l.rate {
 		t.Errorf("quota read as %+v, %v", l, ok)
