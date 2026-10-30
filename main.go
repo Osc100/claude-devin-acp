@@ -37,6 +37,7 @@ func main() {
 	claudeCmd := flag.String("claude", envOr("CLAUDE_DEVIN_CLAUDE", defaultClaude), "command that starts the Claude ACP adapter")
 	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin acp"), "command that starts Devin as an ACP agent")
 	devinOnly := flag.Bool("devin-only", false, "Devin + Devin: the editor talks to Devin itself, its subagents shown as children")
+	claudeSubagents := flag.Bool("claude-subagents", false, "leave Claude its own subagents beside Devin (by default every delegation goes to Devin)")
 	flag.Parse()
 	log.SetPrefix("claude-devin-acp: ")
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -65,14 +66,15 @@ func main() {
 	}
 
 	p := &proxy{
-		editor:   &wire{w: os.Stdout},
-		claude:   &wire{w: toClaude},
-		mcpBase:  "http://" + listener.Addr().String() + "/mcp/",
-		tokens:   map[string]string{},
-		cwds:     map[string]string{},
-		opening:  map[string]opening{},
-		children: map[string]*run{},
-		waiting:  map[string]chan map[string]any{},
+		editor:            &wire{w: os.Stdout},
+		claude:            &wire{w: toClaude},
+		mcpBase:           "http://" + listener.Addr().String() + "/mcp/",
+		tokens:            map[string]string{},
+		cwds:              map[string]string{},
+		opening:           map[string]opening{},
+		children:          map[string]*run{},
+		waiting:           map[string]chan map[string]any{},
+		devinOnlyDelegate: !*claudeSubagents,
 	}
 	p.devin = newDevin(strings.Fields(*devinCmd), p)
 	go func() { log.Fatal(http.Serve(listener, &mcpServer{p: p})) }()
@@ -136,11 +138,15 @@ type proxy struct {
 	devin          *devin
 	mcpBase        string
 
+	// Whether every delegation goes to Devin: Claude's own subagent tools are taken from each
+	// session it opens and its system prompt says to delegate through `devin` instead.
+	devinOnlyDelegate bool
+
 	mu sync.Mutex
 	// Whether the editor said it shows subagents; without that a Devin run is still done and
 	// answered, but nothing is announced, since the RFD forbids it.
 	subagents bool
-	tokens    map[string]string  // MCP token → Claude's session id
+	tokens    map[string]string  // MCP token → Claude's session id, empty until Claude has answered
 	cwds      map[string]string  // Claude's session id → the directory the editor opened it in
 	opening   map[string]opening // the editor's request id → the session it opens
 	children  map[string]*run    // a child session id the editor sees → the Devin run it is
@@ -204,10 +210,15 @@ func (p *proxy) fromEditor(line []byte) {
 		params["mcpServers"] = append(servers, map[string]any{
 			"type": "http", "name": "devin", "url": p.mcpBase + token, "headers": []any{},
 		})
+		if p.devinOnlyDelegate {
+			delegateToDevin(params)
+		}
 		p.mu.Lock()
 		p.opening[idKey(msg["id"])] = opening{token: token, sessionID: sessionID, cwd: cwd}
+		// Known at once, its session not yet: Claude connects to its MCP servers while it opens
+		// the session, before its answer says which session that is.
+		p.tokens[token] = sessionID
 		if sessionID != "" {
-			p.tokens[token] = sessionID
 			p.cwds[sessionID] = cwd
 		}
 		p.mu.Unlock()
@@ -290,4 +301,53 @@ func (p *proxy) cwdOf(session string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.cwds[session]
+}
+
+// claudeSubagentTools are Claude Code's own ways to start a subagent: `Agent`, and `Task`, its name
+// before. Taken away, Claude has `devin` alone to delegate with.
+var claudeSubagentTools = []string{"Agent", "Task"}
+
+const delegationPrompt = `Delegation in this session goes to Devin, a separate coding agent on this machine, through the ` +
+	"`mcp__devin__devin`" + ` tool; your own subagent tools are not available. Hand Devin any work you would have given a subagent — exploring a codebase, implementing, reviewing, running long tasks — as a complete, self-contained task, then check what it reports before relying on it. Do small, quick steps yourself.`
+
+// delegateToDevin takes Claude's own subagent tools out of a session/new, session/load or
+// session/resume and appends to its system prompt that delegation goes to Devin. Both through the
+// Claude adapter's `_meta` extensions (claude-agent-acp's NewSessionMeta): `claudeCode.options
+// .disallowedTools` is merged with the adapter's own, and `systemPrompt.append` is added to Claude
+// Code's preset. Whatever the editor put in either is kept.
+func delegateToDevin(params map[string]any) {
+	meta, _ := params["_meta"].(map[string]any)
+	if meta == nil {
+		meta = map[string]any{}
+		params["_meta"] = meta
+	}
+	claudeCode, _ := meta["claudeCode"].(map[string]any)
+	if claudeCode == nil {
+		claudeCode = map[string]any{}
+		meta["claudeCode"] = claudeCode
+	}
+	options, _ := claudeCode["options"].(map[string]any)
+	if options == nil {
+		options = map[string]any{}
+		claudeCode["options"] = options
+	}
+	disallowed, _ := options["disallowedTools"].([]any)
+	for _, tool := range claudeSubagentTools {
+		disallowed = append(disallowed, tool)
+	}
+	options["disallowedTools"] = disallowed
+
+	switch prompt := meta["systemPrompt"].(type) {
+	case string:
+		// A whole prompt of the editor's own replaces Claude Code's; the note goes at its end.
+		meta["systemPrompt"] = prompt + "\n\n" + delegationPrompt
+	case map[string]any:
+		if appended, _ := prompt["append"].(string); appended != "" {
+			prompt["append"] = appended + "\n\n" + delegationPrompt
+		} else {
+			prompt["append"] = delegationPrompt
+		}
+	default:
+		meta["systemPrompt"] = map[string]any{"append": delegationPrompt}
+	}
 }

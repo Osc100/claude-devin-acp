@@ -80,6 +80,8 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "tools/list":
 		reply["result"] = map[string]any{"tools": []json.RawMessage{json.RawMessage(devinTool)}}
 	case "tools/call":
+		// Looked up at the call, not at the connection: the session was still being opened then.
+		parent, _ = s.p.sessionOf(token)
 		reply["result"] = s.call(r, parent, params)
 	default:
 		reply["error"] = map[string]any{"code": -32601, "message": "no method " + method}
@@ -91,6 +93,9 @@ func (s *mcpServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *mcpServer) call(r *http.Request, parent string, params map[string]any) map[string]any {
 	if name, _ := params["name"].(string); name != "devin" {
 		return toolResult("no tool "+name, true)
+	}
+	if parent == "" {
+		return toolResult("the session is still being opened; call devin again", true)
 	}
 	args, _ := params["arguments"].(map[string]any)
 	task, _ := args["task"].(string)
