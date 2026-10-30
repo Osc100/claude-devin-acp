@@ -62,6 +62,23 @@ type server struct {
 	sessions map[string]*served // a conversation's key → the Devin session it is
 
 	rev *reviewer
+	// maxTasks is how many conversations may be in a turn at once, nought for no limit: Devin's
+	// rate limit is shared by them all. The permission reviewer is not one of them.
+	maxTasks int
+	// opening is how many conversations are opening their Devin session, counted against maxTasks.
+	opening int
+}
+
+// full is the answer to a turn there is no room for: the tasks taking the room, and what to do.
+type full struct{ tasks []task }
+
+func (f *full) Error() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Devin is at capacity: %d tasks are running, the most it runs at once, so this task was not started. Wait for one of them to finish (its completion notice, or the devin MCP server's task_status), then start this task again.\n\nRunning:", len(f.tasks))
+	for _, t := range f.tasks {
+		fmt.Fprintf(&b, "\n- %s: %s (working for %s)", t.Session, t.Title, ago(t.Since))
+	}
+	return b.String()
 }
 
 // loopback is the address a listen address is reached at from this machine.
@@ -146,12 +163,12 @@ func (s *server) save() {
 	}
 }
 
-func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort string) {
+func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort string, maxTasks int) {
 	cwd, _ := os.Getwd()
 	cache, _ := os.UserCacheDir()
 	p := &proxy{children: map[string]*run{}, waiting: map[string]chan map[string]any{}}
 	s := &server{d: newDevin(devinArgs, p), cwd: cwd, sessions: map[string]*served{},
-		store: filepath.Join(cache, "claude-devin-acp", "conversations.json")}
+		store: filepath.Join(cache, "claude-devin-acp", "conversations.json"), maxTasks: maxTasks}
 	s.d.idleAfter = idleAfter
 	s.d.effort = effort
 	p.devin = s.d
@@ -241,6 +258,16 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 		key = hex.EncodeToString(sum[:])
 	}
 	conversation, prompt, err := s.turn(key, cwd, users)
+	var noRoom *full
+	if errors.As(err, &noRoom) {
+		// Answered, not failed: the caller is told why and what to do, where an HTTP error
+		// would be retried by the client without a word.
+		log.Printf("turn refused in %s: Devin is at capacity (%d tasks)", cwd, len(noRoom.tasks))
+		out := newReply(w, chat.Stream)
+		out.line(iconWait + " " + noRoom.Error())
+		out.finish()
+		return
+	}
 	if err != nil {
 		log.Printf("turn refused in %s: %v", cwd, err)
 		http.Error(w, err.Error(), http.StatusConflict)
@@ -369,6 +396,28 @@ func (s *server) turn(key, cwd string, users []string) (*served, string, error) 
 	if conversation != nil && conversation.busy {
 		s.mu.Unlock()
 		return nil, "", errors.New("Devin is still working on this conversation's last turn")
+	}
+	if s.maxTasks > 0 {
+		running := s.opening
+		var tasks []task
+		for _, c := range s.sessions {
+			if c.busy {
+				running++
+				tasks = append(tasks, s.taskOf(c))
+			}
+		}
+		if running >= s.maxTasks {
+			s.mu.Unlock()
+			return nil, "", &full{tasks}
+		}
+	}
+	if conversation == nil {
+		s.opening++
+		defer func() {
+			s.mu.Lock()
+			s.opening--
+			s.mu.Unlock()
+		}()
 	}
 	if conversation != nil && conversation.users >= len(users) {
 		// The same turn asked again (a retry): Devin answers the last message again.

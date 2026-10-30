@@ -85,6 +85,10 @@ In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devi
 subagent`, `model: devin/swe-2-high`); Claude, through OpenCode's Claude Agent provider, starts it
 with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
 
+At most `--max-tasks` (6) tasks run at once, since Devin's rate limit is shared by all of them;
+the permission reviewer is not counted. One more is not started: its reply says which tasks are
+running and to start it again once one finishes.
+
 Limits: Devin retries a rate limit itself, and once its retries are spent it answers the turn
 with an error saying when the limit lifts; `serve` then says so, waits until then, and has Devin
 go on (up to five times a turn). A used-up daily quota is reported as that, not waited out.

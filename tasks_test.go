@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
 	"path/filepath"
@@ -132,5 +133,27 @@ func TestALimitIsReadOffDevinsError(t *testing.T) {
 	}
 	if _, ok := limitOf(&acpError{message: "no such session"}, now); ok {
 		t.Error("an unrelated error is a limit")
+	}
+}
+
+// A seventh task is not started, and the answer says which six are running and how to wait.
+func TestATaskOverTheLimitIsToldToWait(t *testing.T) {
+	s := &server{sessions: map[string]*served{}, maxTasks: 2}
+	for _, id := range []string{"ses_a", "ses_b"} {
+		s.sessions[id] = &served{r: &run{devinSession: id}, session: id, title: "task " + id, busy: true, live: true,
+			started: time.Now().Add(-time.Minute), act: &activity{}}
+	}
+	_, _, err := s.turn("ses_c", "/work", []string{"one more"})
+	var noRoom *full
+	if !errors.As(err, &noRoom) || len(noRoom.tasks) != 2 {
+		t.Fatalf("got %v", err)
+	}
+	for _, want := range []string{"at capacity", "ses_a", "task ses_b", "task_status"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the answer does not say %q:\n%s", want, err)
+		}
+	}
+	if s.sessions["ses_c"] != nil || s.opening != 0 {
+		t.Error("the refused task was started")
 	}
 }

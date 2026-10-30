@@ -45,6 +45,7 @@ func main() {
 	serve := flag.String("serve", "", "Devin as a model: serve an OpenAI-compatible chat endpoint on this address (e.g. 127.0.0.1:47821)")
 	devinIdle := flag.Duration("devin-idle", 10*time.Minute, "stop Devin after this long with no turn running (0 keeps it); its sessions are loaded again on the next turn")
 	devinEffort := flag.String("devin-effort", "high", "how hard Devin (SWE-2) thinks when a turn asks for nothing else: medium, high or max")
+	maxTasks := flag.Int("max-tasks", 6, "serve: how many Devin tasks may run at once (0 for no limit); one more is answered with how to wait for room")
 	claudeSubagents := flag.Bool("claude-subagents", false, "leave Claude its own subagents beside Devin (by default every delegation goes to Devin)")
 	flag.Parse()
 	if !efforts[*devinEffort] {
@@ -58,7 +59,7 @@ func main() {
 		return
 	}
 	if *serve != "" {
-		runServe(*serve, strings.Fields(*devinCmd), *devinIdle, *devinEffort)
+		runServe(*serve, strings.Fields(*devinCmd), *devinIdle, *devinEffort, *maxTasks)
 		return
 	}
 
