@@ -1,6 +1,7 @@
 # claude-devin-acp
 
-Claude, with the local Devin CLI as its subagent, as one ACP agent for an editor such as Zed.
+Claude, with the local Devin CLI as its subagent, as one ACP agent for an editor such as Zed. With
+`--devin-only`, Devin on its own, with its subagents shown as children ("Devin + Devin").
 
 The editor starts this proxy in place of the Claude adapter. Every message between the editor
 and Claude passes through unchanged. On top of that, every session Claude opens gets one more MCP
@@ -39,11 +40,24 @@ is the RFD form this proxy speaks.
   "Claude + Devin": {
     "type": "custom",
     "command": "/home/osc/Projects/claude-devin-acp/claude-devin-acp"
+  },
+  "Devin + Devin": {
+    "type": "custom",
+    "command": "/home/osc/Projects/claude-devin-acp/claude-devin-acp",
+    "args": ["--devin-only"]
   }
 }
 ```
 
-Then start a "Claude + Devin" thread and ask Claude to hand something to Devin.
+In a "Claude + Devin" thread, ask Claude to hand something to Devin. A "Devin + Devin" thread is
+Devin's own, as Zed's registry Devin would be, but its subagents are shown as cards.
+
+## Devin + Devin
+
+Zed sends the RFD's `subagents` capability, which Devin ignores; Devin reports its subagents only
+when told with flags of Cognition's own, and then in a form Zed does not draw. So the proxy adds
+the flags to the editor's `initialize` (only when the editor shows subagents) and translates what
+comes back. Devin's top agent passes through untouched, being the editor's own thread.
 
 ## What is shown
 
@@ -64,8 +78,8 @@ Not done: re-opening an old thread does not bring back the Devin cards (the RFD'
 ```sh
 mise install                 # Go, pinned in mise.toml
 go test ./...                # the translation, replayed from a recorded Devin session
-CLAUDE_DEVIN_E2E=1 CLAUDE_DEVIN_E2E_DIR=<scratch repo> go test -run TestEndToEnd -v ./...
-                             # the whole pipe with a fake Claude and the real Devin (spends Devin quota)
+CLAUDE_DEVIN_E2E=1 CLAUDE_DEVIN_E2E_DIR=<scratch repo> go test -run 'EndToEnd' -v ./...
+                             # both modes against the real Devin, Claude faked (spends Devin quota)
 go build -o claude-devin-acp .
 ```
 

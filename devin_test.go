@@ -34,7 +34,7 @@ func replay(t *testing.T, shown bool) (*run, []map[string]any) {
 			t.Fatal(err)
 		}
 		if msg["method"] == "session/update" {
-			d.update(msg["params"].(map[string]any))
+			d.update(msg["params"].(map[string]any), nil)
 		}
 	}
 	var sent []map[string]any

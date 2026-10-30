@@ -128,3 +128,91 @@ func TestEndToEnd(t *testing.T) {
 		t.Errorf("the tool's answer does not carry Devin's answer and run id")
 	}
 }
+
+// TestSoloEndToEnd is Devin + Devin against the real Devin CLI: the test is the editor, the proxy
+// runs with --devin-only. Opt-in for the same reason as TestEndToEnd.
+func TestSoloEndToEnd(t *testing.T) {
+	if os.Getenv("CLAUDE_DEVIN_E2E") != "1" {
+		t.Skip("spends Devin quota: set CLAUDE_DEVIN_E2E=1")
+	}
+	work := os.Getenv("CLAUDE_DEVIN_E2E_DIR")
+	if work == "" {
+		t.Fatal("set CLAUDE_DEVIN_E2E_DIR")
+	}
+	bin := filepath.Join(t.TempDir(), "proxy")
+	if out, err := exec.Command("go", "build", "-o", bin, ".").CombinedOutput(); err != nil {
+		t.Fatalf("building: %v\n%s", err, out)
+	}
+	proxy := exec.Command(bin, "--devin-only")
+	proxy.Stderr = os.Stderr
+	in, _ := proxy.StdinPipe()
+	out, _ := proxy.StdoutPipe()
+	if err := proxy.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer proxy.Process.Kill()
+	send := func(msg map[string]any) {
+		line, _ := json.Marshal(msg)
+		_, _ = in.Write(append(line, '\n'))
+	}
+	scanner := bufio.NewScanner(out)
+	scanner.Buffer(make([]byte, 1<<20), 16<<20)
+	var seen []map[string]any
+	await := func(id float64) map[string]any {
+		for scanner.Scan() {
+			var msg map[string]any
+			if json.Unmarshal(scanner.Bytes(), &msg) != nil {
+				continue
+			}
+			seen = append(seen, msg)
+			if msg["method"] == "session/request_permission" {
+				send(map[string]any{"jsonrpc": "2.0", "id": msg["id"],
+					"result": map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}})
+			}
+			if got, _ := msg["id"].(float64); got == id && msg["method"] == nil {
+				return msg
+			}
+		}
+		t.Fatalf("the proxy closed before answering %v", id)
+		return nil
+	}
+	send(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": map[string]any{
+		"protocolVersion": 1, "clientCapabilities": map[string]any{"subagents": map[string]any{}}}})
+	await(1)
+	send(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "session/new",
+		"params": map[string]any{"cwd": work, "mcpServers": []any{}}})
+	root := await(2)["result"].(map[string]any)["sessionId"].(string)
+	send(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "session/prompt", "params": map[string]any{
+		"sessionId": root, "prompt": []any{map[string]any{"type": "text", "text": "Use exactly one subagent " +
+			"(spawn it with your subagent tool) to read calc.py and main.py and report what main.py prints, " +
+			"wait for it, then answer in one sentence. Do not edit any file."}}}})
+	if stop := await(3)["result"].(map[string]any)["stopReason"]; stop != "end_turn" {
+		t.Errorf("Devin stopped with %v", stop)
+	}
+	var announced, ended bool
+	var subCalls int
+	for _, msg := range seen {
+		if msg["method"] != "session/update" {
+			continue
+		}
+		session, update := updateOf(msg)
+		child, _ := update["sessionId"].(string)
+		switch {
+		case update["sessionUpdate"] == "subagent_update" && session == root && strings.HasPrefix(child, root+"/"):
+			state, _ := update["state"].(map[string]any)
+			announced = announced || state["state"] == "running"
+			ended = ended || (state["state"] == "idle" && state["stopReason"] == "end_turn")
+			if desc, _ := update["description"].(string); desc != "" {
+				t.Logf("subagent %s: %s", child, desc)
+			}
+		case update["sessionUpdate"] == "tool_call" && strings.HasPrefix(session, root+"/"):
+			subCalls++
+		}
+	}
+	if !announced || !ended {
+		t.Errorf("Devin's subagent: announced %v, ended %v", announced, ended)
+	}
+	if subCalls == 0 {
+		t.Error("the subagent's own calls never reached its thread")
+	}
+}

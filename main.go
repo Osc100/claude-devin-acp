@@ -36,9 +36,14 @@ func main() {
 		".local/share/zed/external_agents/registry/npx/claude-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js")
 	claudeCmd := flag.String("claude", envOr("CLAUDE_DEVIN_CLAUDE", defaultClaude), "command that starts the Claude ACP adapter")
 	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin acp"), "command that starts Devin as an ACP agent")
+	devinOnly := flag.Bool("devin-only", false, "Devin + Devin: the editor talks to Devin itself, its subagents shown as children")
 	flag.Parse()
 	log.SetPrefix("claude-devin-acp: ")
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	if *devinOnly {
+		runSolo(strings.Fields(*devinCmd))
+		return
+	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

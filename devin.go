@@ -216,7 +216,7 @@ func (d *devin) fromDevin(line []byte) {
 		}
 	case method == "session/update":
 		params, _ := msg["params"].(map[string]any)
-		d.update(params)
+		d.update(params, nil)
 	case method == "session/request_permission":
 		go d.askPermission(msg)
 	case msg["id"] != nil:
@@ -241,9 +241,13 @@ func ownerOf(meta map[string]any) string {
 	return rootAgent
 }
 
-func (d *devin) update(params map[string]any) {
+// update translates one of Devin's session updates for the run it belongs to (looked up when r is
+// nil): a subagent's start and end become the RFD's announcements, and its traffic its own session.
+func (d *devin) update(params map[string]any, r *run) {
 	devinSession, _ := params["sessionId"].(string)
-	r := d.runOf(devinSession)
+	if r == nil {
+		r = d.runOf(devinSession)
+	}
 	update, _ := params["update"].(map[string]any)
 	if r == nil || update == nil {
 		return
