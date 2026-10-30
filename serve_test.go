@@ -43,7 +43,7 @@ func TestARecordedTurnStreamsAsTextAndLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	content := reply.Choices[0].Message.Content
-	for _, want := range []string{"Started a subagent (Explore)", "Subagent finished", "5"} {
+	for _, want := range []string{"Subagent (Explore)", "Subagent finished", "5"} {
 		if !strings.Contains(content, want) {
 			t.Errorf("the reply does not say %q:\n%s", want, content)
 		}

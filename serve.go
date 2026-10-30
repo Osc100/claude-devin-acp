@@ -238,7 +238,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	s.d.busy()
 	defer s.d.rested()
 	if err := s.d.open(r); err != nil {
-		out.line("Devin did not start: " + err.Error())
+		out.line(iconError + " Devin did not start: " + err.Error())
 		out.finish()
 		return
 	}
@@ -284,7 +284,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 				out.event(<-events)
 			}
 			if err != nil {
-				out.line("Devin did not finish: " + err.Error())
+				out.line(iconError + " Devin did not finish: " + err.Error())
 			}
 			out.finish()
 			log.Printf("turn %d of %s ended (error: %v)", conversation.users, r.devinSession, err)
@@ -490,22 +490,22 @@ func (o *reply) event(e event) {
 	if started, _ := meta[metaStarted].(map[string]any); started != nil {
 		title, _ := started["title"].(string)
 		profile, _ := started["profile"].(string)
-		o.line(fmt.Sprintf("Started a subagent (%s): %s", profile, title))
+		o.line(fmt.Sprintf("%s Subagent (%s): %s", iconSubagent, profile, title))
 		return
 	}
 	if completed, _ := meta[metaCompleted].(map[string]any); completed != nil {
 		summary, _ := completed["summary"].(string)
 		if success, _ := completed["success"].(bool); success {
-			o.line("Subagent finished: " + firstLine(summary))
+			o.line(iconDone + " Subagent finished: " + firstLine(summary))
 		} else {
-			o.line("Subagent failed: " + firstLine(summary))
+			o.line(iconError + " Subagent failed: " + firstLine(summary))
 		}
 		return
 	}
 	kind, _ := update["sessionUpdate"].(string)
 	if kind == steered {
 		message, _ := update["message"].(string)
-		o.line("Message from the lead agent: " + firstLine(message))
+		o.line(iconMessage + " Lead agent: " + firstLine(message))
 		return
 	}
 	if kind == permissionRefused {
@@ -513,7 +513,7 @@ func (o *reply) event(e event) {
 		if title, _ := update["title"].(string); title != "" {
 			what = "Devin asked permission to " + title
 		}
-		o.line(what + "; refused, with nobody here to ask")
+		o.line(iconLocked + " " + what + "; refused, with nobody here to ask")
 		return
 	}
 	if e.owner != rootAgent {
@@ -535,12 +535,44 @@ func (o *reply) event(e event) {
 		if strings.HasPrefix(id, "run_subagent:") || strings.HasPrefix(id, "read_subagent:") {
 			return // said by the subagent's own lines
 		}
-		o.line(toolTitle(update, meta, o.cwd))
+		o.line(toolIcon(update) + " " + toolTitle(update, meta, o.cwd))
 	case "tool_call_update":
 		if status, _ := update["status"].(string); status == "failed" {
-			o.line("Failed: " + toolTitle(update, meta, o.cwd))
+			o.line(iconError + " " + toolTitle(update, meta, o.cwd) + " failed")
 		}
 	}
+}
+
+// The lines' icons, from the Codicons in Nerd Fonts, for a terminal font that has them.
+const (
+	iconTool     = "\ueb6d" // cod-tools
+	iconTerminal = "\uea85" // cod-terminal
+	iconFile     = "\uea7b" // cod-file
+	iconEdit     = "\uea73" // cod-edit
+	iconSearch   = "\uea6d" // cod-search
+	iconWeb      = "\ueb01" // cod-globe
+	iconSubagent = "\ueb08" // cod-hubot
+	iconDone     = "\ueab2" // cod-check
+	iconError    = "\uea87" // cod-error
+	iconMessage  = "\uea6b" // cod-comment
+	iconLocked   = "\uea75" // cod-lock
+)
+
+// toolIcon is the icon of a tool call's kind, as ACP names kinds.
+func toolIcon(update map[string]any) string {
+	switch kind, _ := update["kind"].(string); kind {
+	case "execute":
+		return iconTerminal
+	case "read":
+		return iconFile
+	case "edit", "delete", "move":
+		return iconEdit
+	case "search":
+		return iconSearch
+	case "fetch":
+		return iconWeb
+	}
+	return iconTool
 }
 
 // toolTitle is a tool call as a line says it: Devin's title for it, and what it was called on
