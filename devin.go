@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -36,6 +37,12 @@ const (
 	// permissionRefused is the update a run's watcher is handed for a permission Devin asked
 	// for with no editor to ask: not one of Devin's own.
 	permissionRefused = "_permission_refused"
+	// permissionReviewed is the one handed for a permission the reviewer decided.
+	permissionReviewed = "_permission_reviewed"
+	// turnStopped is the one handed for Devin's account of a turn it ended: its stats.
+	turnStopped = "_turn_stopped"
+	// thinkingDone is the one handed when Devin ends a block of thinking.
+	thinkingDone = "_thinking_done"
 )
 
 // forwarded are the updates of a Devin session that make sense in a child's transcript. Its mode,
@@ -68,6 +75,8 @@ type devin struct {
 	proc   *os.Process
 	turns  int // turns running now
 	idle   *time.Timer
+	// reviewer, when set, decides the permissions Devin asks for with no editor to ask (`serve`).
+	reviewer *reviewer
 }
 
 // busy notes a turn starting: Devin is not stopped while any runs.
@@ -180,6 +189,10 @@ type run struct {
 	answer strings.Builder   // what Devin's top agent said this turn, which goes back to Claude
 	broken bool              // whether Devin did something else since `answer` last grew
 	title  string            // the label of its latest turn
+	task   string            // what it was first asked, which the permission reviewer is told
+	// calls are its tool calls in progress as Devin described them, by id: a permission request
+	// names only the call's id.
+	calls map[string]map[string]any
 	// watch, when set, is handed every update of the run with the agent it belongs to, before
 	// anything else is done with it: how `serve` streams a run to a client that is no editor.
 	watch func(owner string, update map[string]any)
@@ -355,16 +368,35 @@ func (d *devin) fromDevin(line []byte) {
 	case method == "session/request_permission":
 		go d.askPermission(msg)
 	case method == "_cognition.ai/agent_stopped":
-		// Devin's own word on which model a turn ran on: the check that a run is SWE-2 at the
-		// effort it was set to.
+		// Devin's own word on which model a turn ran on (the check that a run is SWE-2 at the
+		// effort it was set to), and what the turn did.
 		params, _ := msg["params"].(map[string]any)
 		stats, _ := params["stats"].(map[string]any)
 		log.Printf("a Devin turn ended on %v", stats["modelLabel"])
+		d.tell(params, map[string]any{"sessionUpdate": turnStopped, "stats": stats, "cause": params["cause"]})
+	case method == "_cognition.ai/thinking_complete":
+		params, _ := msg["params"].(map[string]any)
+		d.tell(params, map[string]any{"sessionUpdate": thinkingDone})
 	case msg["id"] != nil:
 		d.reply(map[string]any{"jsonrpc": "2.0", "id": msg["id"],
 			"error": map[string]any{"code": -32601, "message": "not offered by claude-devin-acp"}})
 	}
 	// Devin's `_cognition.ai/*` notifications are its own and go nowhere.
+}
+
+// tell hands the watcher of the run a notification of Devin's names an update of the proxy's own.
+func (d *devin) tell(params, update map[string]any) {
+	devinSession, _ := params["sessionId"].(string)
+	r := d.runOf(devinSession)
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	watch, replaying := r.watch, r.replaying
+	r.mu.Unlock()
+	if watch != nil && !replaying {
+		watch(rootAgent, update)
+	}
 }
 
 func (d *devin) runOf(devinSession string) *run {
@@ -400,6 +432,9 @@ func (d *devin) update(params map[string]any, r *run) {
 	r.mu.Unlock()
 	if replaying {
 		return
+	}
+	if kind, _ := update["sessionUpdate"].(string); kind == "tool_call" || kind == "tool_call_update" {
+		r.noteCall(update)
 	}
 	if watch != nil {
 		watch(owner, update)
@@ -459,6 +494,50 @@ func (d *devin) update(params map[string]any, r *run) {
 	}
 }
 
+// noteCall keeps what Devin says of a tool call until it is over.
+func (r *run) noteCall(update map[string]any) {
+	id, _ := update["toolCallId"].(string)
+	if id == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if status, _ := update["status"].(string); status == "completed" || status == "failed" {
+		delete(r.calls, id)
+		return
+	}
+	if r.calls == nil {
+		r.calls = map[string]map[string]any{}
+	}
+	call := r.calls[id]
+	if call == nil {
+		call = map[string]any{}
+		r.calls[id] = call
+	}
+	for key, value := range update {
+		if key != "sessionUpdate" && value != nil {
+			call[key] = value
+		}
+	}
+}
+
+// callOf is a tool call as Devin described it, with what a permission request adds.
+func (r *run) callOf(asked map[string]any) map[string]any {
+	id, _ := asked["toolCallId"].(string)
+	call := map[string]any{}
+	r.mu.Lock()
+	for key, value := range r.calls[id] {
+		call[key] = value
+	}
+	r.mu.Unlock()
+	for key, value := range asked {
+		if value != nil {
+			call[key] = value
+		}
+	}
+	return call
+}
+
 // parentOf is the editor session a nested child was announced under: everything up to its last
 // `/`, since a child's id is its parent's id and its own Devin agent id.
 func (r *run) parentOf(session string) string {
@@ -480,10 +559,34 @@ func (d *devin) askPermission(msg map[string]any) {
 		d.reply(reply)
 		return
 	}
-	call, _ := params["toolCall"].(map[string]any)
+	asked, _ := params["toolCall"].(map[string]any)
+	call := r.callOf(asked)
 	meta, _ := call["_meta"].(map[string]any)
+	if v := d.reviewer; d.p.editor == nil && v != nil {
+		if !v.is(devinSession) {
+			d.reviewed(msg["id"], r, params, call, v.review(r, call))
+			return
+		}
+		if ownTool(call) {
+			// The reviewer's one tool, which it asks to call like any other: allowed for the
+			// session, so it is not asked again.
+			options, _ := params["options"].([]any)
+			option := chosen(options, true)
+			for _, offered := range options {
+				if offered, _ := offered.(map[string]any); offered["optionId"] == "allow_server_session" {
+					option = "allow_server_session"
+				}
+			}
+			reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "selected", "optionId": option}}
+			d.reply(reply)
+			return
+		}
+		raw, _ := json.Marshal(params)
+		log.Printf("refusing the permission reviewer's own request: %.1500s", raw)
+	}
 	if d.p.editor == nil {
-		// No editor, so nobody to ask (`serve`): refused, and the run's watcher is told.
+		// No editor, so nobody to ask (`serve`), or it is the reviewer's own: refused, and the
+		// run's watcher is told.
 		reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}
 		d.reply(reply)
 		r.mu.Lock()
@@ -507,6 +610,35 @@ func (d *devin) askPermission(msg map[string]any) {
 		reply["error"] = answer["error"]
 	}
 	d.reply(reply)
+}
+
+// reviewed answers a permission request as the reviewer decided it, tells the run's watcher, and
+// tells the asking session why it was denied, which no answer to a request can say.
+func (d *devin) reviewed(id any, r *run, params, call map[string]any, v verdict) {
+	options, _ := params["options"].([]any)
+	outcome := map[string]any{"outcome": "cancelled"}
+	if option := chosen(options, v.allow); option != "" {
+		outcome = map[string]any{"outcome": "selected", "optionId": option}
+	}
+	d.reply(map[string]any{"jsonrpc": "2.0", "id": id, "result": map[string]any{"outcome": outcome}})
+	meta, _ := call["_meta"].(map[string]any)
+	r.mu.Lock()
+	watch, cwd := r.watch, r.cwd
+	r.mu.Unlock()
+	title := toolTitle(call, meta, cwd)
+	log.Printf("permission for %s in %s: allowed %v (%s)", title, r.devinSession, v.allow, v.reason)
+	if watch != nil {
+		watch(ownerOf(meta), map[string]any{"sessionUpdate": permissionReviewed, "title": title,
+			"allow": v.allow, "reason": v.reason, "remembered": v.remembered})
+	}
+	if !v.allow {
+		// Devin waits on the answer mid-turn, so this joins that turn.
+		go func() {
+			_, _ = d.request("session/prompt", map[string]any{"sessionId": r.devinSession, "prompt": []any{
+				map[string]any{"type": "text", "text": "(The permission reviewer denied " + title + ": " + v.reason + ")"},
+			}})
+		}()
+	}
 }
 
 // begin hands Devin a task in the run `cont` names, or in a new session, and returns the run at

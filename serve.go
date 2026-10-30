@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +60,20 @@ type server struct {
 
 	mu       sync.Mutex
 	sessions map[string]*served // a conversation's key → the Devin session it is
+
+	rev *reviewer
+}
+
+// loopback is the address a listen address is reached at from this machine.
+func loopback(listen string) string {
+	host, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
 }
 
 // served is a conversation of the client's and the Devin session it is.
@@ -68,6 +84,15 @@ type served struct {
 	busy  bool
 	// live is whether Devin is in a turn of it, which a message steers.
 	live bool
+
+	// What the status tools say of it: OpenCode's id for it (else its key), a title (Devin's, once
+	// it gives one), when its turn started or ended, what it has done, and a channel closed when
+	// the turn in progress ends.
+	session        string
+	title          string
+	started, ended time.Time
+	act            *activity
+	turnEnded      chan struct{}
 }
 
 // kept is a conversation as the store keeps it.
@@ -75,6 +100,7 @@ type kept struct {
 	Session string `json:"session"`
 	Cwd     string `json:"cwd"`
 	Users   int    `json:"users"`
+	Title   string `json:"title,omitempty"`
 }
 
 // load reads the conversations a previous run of the server kept. Their sessions are loaded
@@ -93,7 +119,7 @@ func (s *server) load() {
 		r := &run{child: "devin:" + k.Session, devinSession: k.Session, cwd: k.Cwd,
 			agents: map[string]string{rootAgent: "devin:" + k.Session}}
 		s.d.runs[k.Session] = r
-		s.sessions[key] = &served{r: r, users: k.Users}
+		s.sessions[key] = &served{r: r, users: k.Users, session: key, title: k.Title, act: &activity{}}
 	}
 	log.Printf("kept %d conversations from before", len(stored))
 }
@@ -103,7 +129,7 @@ func (s *server) load() {
 func (s *server) save() {
 	stored := make(map[string]kept, len(s.sessions))
 	for key, conversation := range s.sessions {
-		stored[key] = kept{Session: conversation.r.devinSession, Cwd: conversation.r.cwd, Users: conversation.users}
+		stored[key] = kept{Session: conversation.r.devinSession, Cwd: conversation.r.cwd, Users: conversation.users, Title: conversation.title}
 	}
 	raw, _ := json.Marshal(stored)
 	if err := os.MkdirAll(filepath.Dir(s.store), 0o755); err != nil {
@@ -129,11 +155,17 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort
 	s.d.idleAfter = idleAfter
 	s.d.effort = effort
 	p.devin = s.d
+	s.rev = newReviewer(s.d, "http://"+loopback(listen)+"/mcp/permissions",
+		filepath.Join(cache, "claude-devin-acp", "reviewer"), filepath.Join(cache, "claude-devin-acp", "permissions.json"))
+	s.d.reviewer = s.rev
 	s.load()
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.complete)
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, steerTools, s.call) })
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, serveTools, s.call) })
+	mux.Handle("/mcp/permissions", s.rev)
+	mux.HandleFunc("GET /status", s.status)
+	mux.HandleFunc("GET /status/{session}", s.statusOf)
 	log.Printf("serving Devin as a model on http://%s/v1", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
@@ -217,16 +249,35 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	log.Printf("turn %d of %s in %s (stream %v)", conversation.users, conversation.r.devinSession, cwd, chat.Stream)
 	out := newReply(w, chat.Stream)
 	out.cwd = cwd
+	start := time.Now()
+	ended := make(chan struct{})
+	s.mu.Lock()
+	out.act = conversation.act
+	conversation.started, conversation.turnEnded = start, ended
+	s.mu.Unlock()
+	out.act.write(fmt.Sprintf("\n── turn %d, %s ──\n", conversation.users, start.Format("15:04:05")))
 	defer func() {
 		s.mu.Lock()
 		conversation.busy, conversation.live = false, false
+		conversation.ended = time.Now()
+		close(ended)
 		s.mu.Unlock()
 	}()
+	s.rev.hold()
+	defer s.rev.release()
 
 	events := make(chan event, 4096)
 	r := conversation.r
 	r.mu.Lock()
-	r.watch = func(owner string, update map[string]any) { events <- event{owner, update} }
+	r.watch = func(owner string, update map[string]any) {
+		if title, _ := update["title"].(string); title != "" && update["sessionUpdate"] == "session_info_update" {
+			s.mu.Lock()
+			conversation.title = title
+			s.save()
+			s.mu.Unlock()
+		}
+		events <- event{owner, update}
+	}
 	r.mu.Unlock()
 	defer func() {
 		r.mu.Lock()
@@ -286,11 +337,24 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 			if err != nil {
 				out.line(iconError + " Devin did not finish: " + err.Error())
 			}
+			out.summary(time.Since(start))
 			out.finish()
 			log.Printf("turn %d of %s ended (error: %v)", conversation.users, r.devinSession, err)
 			return
 		}
 	}
+}
+
+// titleOf is a conversation's title until Devin gives it one: the first line of its first message
+// that is not OpenCode's own preamble.
+func titleOf(first string) string {
+	for _, line := range strings.Split(first, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" && !strings.HasPrefix(line, "You are a subagent") {
+			return firstLine(line)
+		}
+	}
+	return "Devin task"
 }
 
 // turn is the Devin session a request's conversation is, opened on its first turn, and what to
@@ -328,7 +392,8 @@ func (s *server) turn(key, cwd string, users []string) (*served, string, error) 
 		s.d.mu.Lock()
 		s.d.runs[devinSession] = r
 		s.d.mu.Unlock()
-		conversation = &served{r: r, busy: true}
+		conversation = &served{r: r, busy: true, session: key, title: titleOf(users[0]), act: &activity{}}
+		r.task = users[0]
 		s.mu.Lock()
 		s.sessions[key] = conversation
 		s.mu.Unlock()
@@ -343,62 +408,6 @@ func (s *server) turn(key, cwd string, users []string) (*served, string, error) 
 	s.save()
 	s.mu.Unlock()
 	return conversation, prompt, nil
-}
-
-const steerTools = `[{
-  "name": "message_task",
-  "title": "Message a running Devin task",
-  "description": "Send a message to Devin while it works on a task you gave it as a background subagent, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. Devin reads it at once, as an interruption, and its reply to the subagent call covers what it did after. Only for a task still running; a finished one is continued with the subagent tool and its sessionID.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent session Devin is working in, as the subagent tool gave it."},
-      "message": {"type": "string", "description": "What to tell Devin."}
-    },
-    "required": ["sessionID", "message"]
-  }
-}]`
-
-// steered is the update a turn's watcher is handed for a message given to Devin mid-turn.
-const steered = "_steered"
-
-func (s *server) call(params map[string]any) map[string]any {
-	if name, _ := params["name"].(string); name != "message_task" {
-		return toolResult("no tool "+name, true)
-	}
-	args, _ := params["arguments"].(map[string]any)
-	session, _ := args["sessionID"].(string)
-	message, _ := args["message"].(string)
-	if strings.TrimSpace(message) == "" {
-		return toolResult("message is required", true)
-	}
-	s.mu.Lock()
-	conversation := s.sessions[session]
-	live := conversation != nil && conversation.live
-	s.mu.Unlock()
-	if conversation == nil {
-		return toolResult("no Devin task in session "+session, true)
-	}
-	if !live {
-		return toolResult("Devin is not working on session "+session+" now; continue it with the subagent tool and this sessionID", true)
-	}
-	r := conversation.r
-	r.mu.Lock()
-	watch := r.watch
-	r.mu.Unlock()
-	if watch != nil {
-		watch(rootAgent, map[string]any{"sessionUpdate": steered, "message": message})
-	}
-	// Answered when the turn it joins ends, as the turn's own prompt is; nothing waits for it.
-	go func() {
-		if _, err := s.d.request("session/prompt", map[string]any{
-			"sessionId": r.devinSession, "prompt": []any{map[string]any{"type": "text", "text": message}},
-		}); err != nil {
-			log.Printf("steering %s: %v", r.devinSession, err)
-		}
-	}()
-	log.Printf("steered %s (%s)", r.devinSession, session)
-	return toolResult("Devin has the message and is going on with it; its reply to the subagent call covers what it does now.", false)
 }
 
 type event struct {
@@ -417,6 +426,14 @@ type reply struct {
 	atLine   bool // whether what was written last ends a line of its own
 	content  strings.Builder
 	thoughts strings.Builder
+	// thought is whether Devin has thought aloud this turn, and gap whether something else came
+	// since, so the next thought is a paragraph of its own and does not run on from the last.
+	thought, gap bool
+	// act, when set, is told everything said, for the status tools.
+	act *activity
+	// stats are Devin's account of the turn, once it ends it.
+	stats map[string]any
+	cause string
 }
 
 func newReply(w http.ResponseWriter, stream bool) *reply {
@@ -448,6 +465,10 @@ func (o *reply) say(s string) {
 	if s == "" {
 		return
 	}
+	if o.act != nil {
+		o.act.write(s)
+	}
+	o.gap = true
 	o.atLine = strings.HasSuffix(s, "\n")
 	if o.stream {
 		o.chunk(map[string]any{"content": s}, nil)
@@ -460,6 +481,10 @@ func (o *reply) think(s string) {
 	if s == "" {
 		return
 	}
+	if o.thought && o.gap {
+		s = "\n\n" + strings.TrimLeft(s, "\n")
+	}
+	o.thought, o.gap = true, false
 	if o.stream {
 		o.chunk(map[string]any{"reasoning_content": s}, nil)
 		return
@@ -473,6 +498,34 @@ func (o *reply) line(s string) {
 		o.say("\n\n")
 	}
 	o.say(s + "\n\n")
+	if o.act != nil {
+		o.act.did(s)
+	}
+}
+
+// summary ends a turn with a line of what it did, from Devin's account of it where there is one.
+func (o *reply) summary(took time.Duration) {
+	var parts []string
+	count := func(key, one, many string) {
+		if n, ok := o.stats[key].(float64); ok {
+			if n == 1 {
+				parts = append(parts, "1 "+one)
+			} else {
+				parts = append(parts, strconv.Itoa(int(n))+" "+many)
+			}
+		}
+	}
+	count("filesChanged", "file changed", "files changed")
+	count("commandsRun", "command", "commands")
+	count("toolCalls", "tool call", "tool calls")
+	parts = append(parts, took.Round(time.Second).String())
+	if model, _ := o.stats["modelLabel"].(string); model != "" {
+		parts = append(parts, model)
+	}
+	if o.cause != "" && o.cause != "complete" {
+		parts = append(parts, "ended: "+o.cause)
+	}
+	o.line(iconSummary + " " + strings.Join(parts, " · "))
 }
 
 func (o *reply) keepalive() {
@@ -503,6 +556,33 @@ func (o *reply) event(e event) {
 		return
 	}
 	kind, _ := update["sessionUpdate"].(string)
+	if kind != "agent_thought_chunk" {
+		o.gap = true
+	}
+	switch kind {
+	case thinkingDone:
+		return
+	case turnStopped:
+		o.stats, _ = update["stats"].(map[string]any)
+		o.cause, _ = update["cause"].(string)
+		return
+	case permissionReviewed:
+		title, _ := update["title"].(string)
+		reason, _ := update["reason"].(string)
+		how := "by the reviewer"
+		if remembered, _ := update["remembered"].(bool); remembered {
+			how = "as before"
+		}
+		if allow, _ := update["allow"].(bool); allow {
+			o.line(fmt.Sprintf("%s Allowed %s: %s (%s)", iconAllowed, how, title, reason))
+		} else {
+			o.line(fmt.Sprintf("%s Denied %s: %s (%s)", iconDenied, how, title, reason))
+		}
+		return
+	case stopAsked:
+		o.line(iconStop + " Asked to stop and report")
+		return
+	}
 	if kind == steered {
 		message, _ := update["message"].(string)
 		o.line(iconMessage + " Lead agent: " + firstLine(message))
@@ -556,6 +636,10 @@ const (
 	iconError    = "\uea87" // cod-error
 	iconMessage  = "\uea6b" // cod-comment
 	iconLocked   = "\uea75" // cod-lock
+	iconAllowed  = "\uebc1" // cod-workspace_trusted
+	iconDenied   = "\uebc2" // cod-workspace_untrusted
+	iconStop     = "\uead7" // cod-debug_stop
+	iconSummary  = "\ueab3" // cod-checklist
 )
 
 // toolIcon is the icon of a tool call's kind, as ACP names kinds.

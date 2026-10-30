@@ -32,6 +32,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		runStatus(os.Args[2:])
+		return
+	}
 	home, _ := os.UserHomeDir()
 	defaultClaude := "node " + filepath.Join(home,
 		".local/share/zed/external_agents/registry/npx/claude-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js")

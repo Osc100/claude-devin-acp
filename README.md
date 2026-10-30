@@ -64,7 +64,15 @@ session: Devin's text as content, its thoughts as reasoning, its tool calls and 
 starts as lines. A conversation is known by the session OpenCode names (`x-opencode-session-id`),
 else by its first user message and the working directory OpenCode's prompt states, so a follow-up
 reaches the same Devin session. Devin is told to do the
-task itself; a permission it asks for is refused, with nobody to ask.
+task itself. Each turn ends with a line of what it did: files changed, commands, tool calls,
+time, and the model Devin says it ran on.
+
+A permission Devin asks for is decided by the permission reviewer: another Devin session, on
+SWE-2 at medium, open while any other session is in a turn, which is handed the request and the
+asking session's task and answers through `decide_permission`, the one tool of an MCP server at
+`/mcp/permissions`. Any other request of its own is refused. Its decisions are kept in
+`~/.cache/claude-devin-acp/permissions.json`, and the exact same tool call in the same directory is
+decided again from there; a denied session is told why.
 
 Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
 `--devin-effort` (high) by default, the model `swe-2-medium`, `swe-2-high` or `swe-2-max` (Devin's
@@ -73,6 +81,12 @@ own names), or a request's `reasoning_effort`. In Claude + Devin, `start_task` t
 In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
 subagent`, `model: devin/swe-2-high`); Claude, through OpenCode's Claude Agent provider, starts it
 with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
+
+Watching and steering: `/mcp` has `task_status` (the tasks running and finished in the last hour,
+each with the last thing it did), `peek_task` (a task's latest lines), `message_task` and
+`stop_task` (tell it to stop now and report, its turn cancelled after a timeout).
+`claude-devin-acp status [-f] [-n lines] [session]` shows the same from a shell, as over SSH: the
+tasks, or what one has done, followed with `-f`.
 
 Steering: OpenCode holds a message for a busy subagent until its step ends, and a step here is
 Devin's whole turn. So the server is also an MCP server at `/mcp`, whose `message_task` takes the
