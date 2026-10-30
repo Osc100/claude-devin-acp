@@ -76,7 +76,7 @@ const limitMargin = time.Minute
 
 // resumeSpacing is how far apart sessions waiting out a rate limit go on: they are all told the
 // same reset time, and going on at once would meet the limit again at once.
-const resumeSpacing = 15 * time.Second
+const resumeSpacing = 30 * time.Second
 
 // resumeSlot is when a session waiting out a rate limit until at goes on: at, or resumeSpacing
 // after the session that goes on last, whichever is later.
