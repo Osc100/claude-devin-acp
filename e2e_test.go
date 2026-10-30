@@ -129,13 +129,13 @@ func TestEndToEnd(t *testing.T) {
 	}
 	_ = json.Unmarshal([]byte(answer), &said)
 	if said.StartedInSeconds > 10 {
-		t.Errorf("devin took %.1fs to answer: it must return as the run starts, not when it ends", said.StartedInSeconds)
+		t.Errorf("start_task took %.1fs to answer: it must return as the run starts, not when it ends", said.StartedInSeconds)
 	}
 	if !strings.Contains(answer, "in the background as run devin:") {
-		t.Errorf("devin did not say which run it started")
+		t.Errorf("start_task did not say which run it started")
 	}
 	if !strings.Contains(answer, "finished") || !strings.Contains(answer, "5") {
-		t.Errorf("devin_wait did not hand back Devin's answer")
+		t.Errorf("wait_for_tasks did not hand back Devin's answer")
 	}
 }
 

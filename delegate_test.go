@@ -37,7 +37,7 @@ func TestClaudeIsLeftDevinAloneToDelegateWith(t *testing.T) {
 		t.Errorf("disallowed %v: Claude's subagent tools must go, and the editor's own must stay", disallowed)
 	}
 	appended := meta["systemPrompt"].(map[string]any)["append"].(string)
-	if !strings.HasPrefix(appended, "The editor's own note.") || !strings.Contains(appended, "mcp__devin__devin") {
+	if !strings.HasPrefix(appended, "The editor's own note.") || !strings.Contains(appended, "mcp__devin__start_task") {
 		t.Errorf("the system prompt's addition is %q", appended)
 	}
 	if servers := params["mcpServers"].([]any); len(servers) != 1 {
@@ -68,7 +68,7 @@ func TestTheDevinServerAnswersBeforeTheSessionIsOpen(t *testing.T) {
 	body := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`)
 	recorder := httptest.NewRecorder()
 	(&mcpServer{p: p}).ServeHTTP(recorder, httptest.NewRequest("POST", path, body))
-	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"devin"`) {
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"start_task"`) {
 		t.Errorf("before Claude answered session/new, the server said %d: %s", recorder.Code, recorder.Body)
 	}
 }

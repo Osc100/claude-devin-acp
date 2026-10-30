@@ -75,10 +75,10 @@ func callDevin(url, task string) string {
 	listed := post(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
 	start := time.Now()
 	started := post(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/call",
-		"params": map[string]any{"name": "devin", "arguments": map[string]any{"task": task, "title": "e2e"}}})
+		"params": map[string]any{"name": "start_task", "arguments": map[string]any{"task": task, "title": "e2e"}}})
 	startedIn := time.Since(start)
 	waited := post(map[string]any{"jsonrpc": "2.0", "id": 4, "method": "tools/call",
-		"params": map[string]any{"name": "devin_wait", "arguments": map[string]any{"timeout_seconds": 300}}})
+		"params": map[string]any{"name": "wait_for_tasks", "arguments": map[string]any{"timeout_seconds": 300}}})
 	raw, _ := json.Marshal(map[string]any{"listed": listed["result"] != nil, "started": started,
 		"startedInSeconds": startedIn.Seconds(), "waited": waited})
 	return fmt.Sprintf("%s", raw)

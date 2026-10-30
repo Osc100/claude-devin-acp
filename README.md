@@ -5,8 +5,9 @@ Claude, with the local Devin CLI as its subagent, as one ACP agent for an editor
 
 The editor starts this proxy in place of the Claude adapter. Every message between the editor
 and Claude passes through unchanged. On top of that, every session Claude opens gets MCP tools for
-Devin: `devin` starts a run of `devin acp` in the background and returns at once, `devin_wait`
-collects runs' answers (or only checks on them), `devin_cancel` stops one. Claude's own subagent
+Devin (`mcp__devin__…` to Claude): `start_task` starts a run of `devin acp` in the background and
+returns at once, `wait_for_tasks` collects runs' answers (or only checks on them), `cancel_task`
+stops one. Claude's own subagent
 tools are taken away and its system prompt says to delegate to Devin (`--claude-subagents` leaves
 them). The editor sees each
 Devin run as a subagent of Claude's session, with Devin's own subagents nested under it, through
@@ -70,8 +71,8 @@ comes back. Devin's top agent passes through untouched, being the editor's own t
   no Stop button: Devin has a way to stop one subagent, but it has not been seen used.
 - **Permissions**: Devin's permission requests are asked in the thread of the agent whose tool
   call it is.
-- **Answer**: `devin_wait` gives Claude each run's status and, once it is done, its final answer.
-  Passing a finished run's id to `devin` as `continue` sends a follow-up to the same Devin session.
+- **Answer**: `wait_for_tasks` gives Claude each run's status and, once it is done, its final answer.
+  Passing a finished run's id to `start_task` as `continue` sends a follow-up to the same Devin session.
   An MCP server cannot wake Claude when a run ends, so Claude collects runs itself; its prompt
   says to before it ends its turn.
 
