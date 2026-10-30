@@ -111,13 +111,14 @@ func (s *server) save() {
 	}
 }
 
-func runServe(listen string, devinArgs []string, idleAfter time.Duration) {
+func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort string) {
 	cwd, _ := os.Getwd()
 	cache, _ := os.UserCacheDir()
 	p := &proxy{children: map[string]*run{}, waiting: map[string]chan map[string]any{}}
 	s := &server{d: newDevin(devinArgs, p), cwd: cwd, sessions: map[string]*served{},
 		store: filepath.Join(cache, "claude-devin-acp", "conversations.json")}
 	s.d.idleAfter = idleAfter
+	s.d.effort = effort
 	p.devin = s.d
 	s.load()
 	mux := http.NewServeMux()
@@ -129,14 +130,19 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration) {
 
 func (s *server) models(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []any{
-		map[string]any{"id": "devin", "object": "model", "owned_by": "cognition"},
-	}})
+	models := []any{map[string]any{"id": "devin", "object": "model", "owned_by": "cognition"}}
+	for _, effort := range []string{"medium", "high", "max"} {
+		models = append(models, map[string]any{"id": "devin-" + effort, "object": "model", "owned_by": "cognition"})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
 
 type chatRequest struct {
-	Stream   bool `json:"stream"`
-	Messages []struct {
+	Model string `json:"model"`
+	// ReasoningEffort is what OpenAI-compatible clients send for a model's effort variant.
+	ReasoningEffort string `json:"reasoning_effort"`
+	Stream          bool   `json:"stream"`
+	Messages        []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
@@ -217,6 +223,11 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	s.d.busy()
 	defer s.d.rested()
 	if err := s.d.open(r); err != nil {
+		out.line("✗ " + err.Error())
+		out.finish()
+		return
+	}
+	if err := s.d.configure(r, effortOf(chat)); err != nil {
 		out.line("✗ " + err.Error())
 		out.finish()
 		return
@@ -489,4 +500,22 @@ func (o *reply) finish() {
 		"id": o.id, "object": "chat.completion", "created": time.Now().Unix(), "model": "devin",
 		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": "stop"}},
 	})
+}
+
+// effortOf is the thinking a request asks Devin for: the model's own (`devin-max`), else the
+// request's `reasoning_effort` where it is one Devin takes (low is taken as medium), else none,
+// for the server's default.
+func effortOf(chat chatRequest) string {
+	if effort, ok := strings.CutPrefix(chat.Model, "devin-"); ok && efforts[effort] {
+		return effort
+	}
+	switch chat.ReasoningEffort {
+	case "minimal", "low", "medium":
+		return "medium"
+	case "high":
+		return "high"
+	case "max", "xhigh":
+		return "max"
+	}
+	return ""
 }

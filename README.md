@@ -65,6 +65,10 @@ starts as lines. A conversation is known by its first user message and the worki
 OpenCode's prompt states, so a follow-up reaches the same Devin session. Devin is told to do the
 task itself; a permission it asks for is refused, with nobody to ask.
 
+Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
+`--devin-effort` (high) by default, the model `devin-medium`, `devin-high` or `devin-max`, or a
+request's `reasoning_effort`. In Claude + Devin, `start_task` takes an `effort`.
+
 In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
 subagent`, `model: devin/devin`); Claude, through OpenCode's Claude Agent provider, starts it
 with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.

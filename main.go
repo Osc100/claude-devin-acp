@@ -40,8 +40,13 @@ func main() {
 	devinOnly := flag.Bool("devin-only", false, "Devin + Devin: the editor talks to Devin itself, its subagents shown as children")
 	serve := flag.String("serve", "", "Devin as a model: serve an OpenAI-compatible chat endpoint on this address (e.g. 127.0.0.1:47821)")
 	devinIdle := flag.Duration("devin-idle", 10*time.Minute, "stop Devin after this long with no turn running (0 keeps it); its sessions are loaded again on the next turn")
+	devinEffort := flag.String("devin-effort", "high", "how hard Devin (SWE-2) thinks when a turn asks for nothing else: medium, high or max")
 	claudeSubagents := flag.Bool("claude-subagents", false, "leave Claude its own subagents beside Devin (by default every delegation goes to Devin)")
 	flag.Parse()
+	if !efforts[*devinEffort] {
+		fmt.Fprintf(os.Stderr, "--devin-effort: no effort %q: medium, high or max\n", *devinEffort)
+		os.Exit(2)
+	}
 	log.SetPrefix("claude-devin-acp: ")
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	if *devinOnly {
@@ -49,7 +54,7 @@ func main() {
 		return
 	}
 	if *serve != "" {
-		runServe(*serve, strings.Fields(*devinCmd), *devinIdle)
+		runServe(*serve, strings.Fields(*devinCmd), *devinIdle, *devinEffort)
 		return
 	}
 
@@ -85,6 +90,7 @@ func main() {
 	}
 	p.devin = newDevin(strings.Fields(*devinCmd), p)
 	p.devin.idleAfter = *devinIdle
+	p.devin.effort = *devinEffort
 	go func() { log.Fatal(http.Serve(listener, &mcpServer{p: p})) }()
 	go func() {
 		p.pump(fromClaude, p.fromClaude)

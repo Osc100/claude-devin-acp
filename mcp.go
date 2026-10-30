@@ -26,7 +26,8 @@ const devinTools = `[{
       "task": {"type": "string", "description": "What Devin should do, self-contained."},
       "title": {"type": "string", "description": "A short label for the run, shown in the editor."},
       "cwd": {"type": "string", "description": "Absolute directory Devin works in. Defaults to the session's directory."},
-      "continue": {"type": "string", "description": "The id of a finished run, to give that Devin session a follow-up instead of starting a new one."}
+      "continue": {"type": "string", "description": "The id of a finished run, to give that Devin session a follow-up instead of starting a new one."},
+      "effort": {"type": "string", "enum": ["medium", "high", "max"], "description": "How hard Devin (SWE-2) thinks. Leave out for the default; max only for hard problems, since it is slower."}
     },
     "required": ["task"]
   }
@@ -128,7 +129,8 @@ func (s *mcpServer) call(r *http.Request, parent string, params map[string]any) 
 		title, _ := args["title"].(string)
 		cwd, _ := args["cwd"].(string)
 		cont, _ := args["continue"].(string)
-		run, err := s.p.devin.begin(parent, task, title, cwd, cont)
+		effort, _ := args["effort"].(string)
+		run, err := s.p.devin.begin(parent, task, title, cwd, cont, effort)
 		if err != nil {
 			log.Printf("starting a Devin run for %s: %v", parent, err)
 			return toolResult("Devin did not start: "+err.Error(), true)

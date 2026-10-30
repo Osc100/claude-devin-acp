@@ -63,9 +63,11 @@ type devin struct {
 	// keep it: a Devin process with a session open holds about 130 MB. A run's session outlives
 	// it, saved by Devin, and is loaded again before the run's next turn (`open`).
 	idleAfter time.Duration
-	proc      *os.Process
-	turns     int // turns running now
-	idle      *time.Timer
+	// effort is the thinking SWE-2 is given when a turn asks for none: medium, high or max.
+	effort string
+	proc   *os.Process
+	turns  int // turns running now
+	idle   *time.Timer
 }
 
 // busy notes a turn starting: Devin is not stopped while any runs.
@@ -96,6 +98,41 @@ func (d *devin) rested() {
 			_ = d.proc.Kill()
 		}
 	})
+}
+
+// sweModel is the one model a Devin run is: SWE-2. Through ACP Devin offers it as this one id,
+// and how hard it thinks is its `thought_level` (SWE-2 "Max" is this model at `max`).
+const sweModel = "swe-2-high"
+
+// efforts are the thinking levels Devin takes for SWE-2.
+var efforts = map[string]bool{"medium": true, "high": true, "max": true}
+
+// configure sets r's session to SWE-2 at effort (the default when empty), unless it already is.
+// The model first: setting it puts the thinking back to the model's own default.
+func (d *devin) configure(r *run, effort string) error {
+	if effort == "" {
+		effort = d.effort
+	}
+	if !efforts[effort] {
+		return fmt.Errorf("no effort %q: medium, high or max", effort)
+	}
+	r.mu.Lock()
+	set := r.effort == effort
+	r.mu.Unlock()
+	if set {
+		return nil
+	}
+	for _, option := range [][2]string{{"model", sweModel}, {"thought_level", effort}} {
+		if _, err := d.request("session/set_config_option", map[string]any{
+			"sessionId": r.devinSession, "configId": option[0], "value": option[1],
+		}); err != nil {
+			return fmt.Errorf("setting Devin's %s: %w", option[0], err)
+		}
+	}
+	r.mu.Lock()
+	r.effort = effort
+	r.mu.Unlock()
+	return nil
 }
 
 // open has Devin running and holding r's session: loaded again if this Devin process has not
@@ -151,6 +188,9 @@ type run struct {
 	// loaded is whether the running Devin process holds its session; replaying, whether it is
 	// replaying it as it loads, when nothing it says is new.
 	loaded, replaying bool
+	// effort is the thinking its session was last set to, empty when it is not known to be set
+	// (a new process, a session loaded again).
+	effort string
 
 	// Its latest turn: done is closed when it ends, outcome and failure are then what it said
 	// and what went wrong.
@@ -210,7 +250,7 @@ func (d *devin) start() error {
 		d.ready, d.in, d.proc = nil, nil, nil
 		for _, r := range d.runs {
 			r.mu.Lock()
-			r.loaded = false
+			r.loaded, r.effort = false, ""
 			r.mu.Unlock()
 		}
 		for id, answer := range d.pending {
@@ -314,6 +354,12 @@ func (d *devin) fromDevin(line []byte) {
 		d.update(params, nil)
 	case method == "session/request_permission":
 		go d.askPermission(msg)
+	case method == "_cognition.ai/agent_stopped":
+		// Devin's own word on which model a turn ran on: the check that a run is SWE-2 at the
+		// effort it was set to.
+		params, _ := msg["params"].(map[string]any)
+		stats, _ := params["stats"].(map[string]any)
+		log.Printf("a Devin turn ended on %v", stats["modelLabel"])
 	case msg["id"] != nil:
 		d.reply(map[string]any{"jsonrpc": "2.0", "id": msg["id"],
 			"error": map[string]any{"code": -32601, "message": "not offered by claude-devin-acp"}})
@@ -467,7 +513,7 @@ func (d *devin) askPermission(msg map[string]any) {
 // once: Devin works in the background, its card running, and the run's turn is collected with
 // wait. Claude is never held on a call while Devin works, as Claude Code's own background agents
 // do not hold it.
-func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
+func (d *devin) begin(parent, task, title, cwd, cont, effort string) (*run, error) {
 	if err := d.start(); err != nil {
 		return nil, err
 	}
@@ -502,6 +548,9 @@ func (d *devin) begin(parent, task, title, cwd, cont string) (*run, error) {
 		d.p.mu.Lock()
 		d.p.children[r.child] = r
 		d.p.mu.Unlock()
+	}
+	if err := d.configure(r, effort); err != nil {
+		return nil, err
 	}
 	r.mu.Lock()
 	if r.done != nil && !r.finished {
