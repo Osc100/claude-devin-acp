@@ -51,6 +51,23 @@ const keepalive = 15 * time.Second
 
 var workingDirectory = regexp.MustCompile(`(?m)^\s*Working directory: (.+?)\s*$`)
 
+// worktreeLine is how the agent handing Devin a task names the worktree it is for, at the head of
+// the task: `Worktree: /abs/path`. OpenCode's subagent tool takes no directory, and a subagent runs
+// where its parent does; a task's Devin session opens in the worktree this names instead.
+var worktreeLine = regexp.MustCompile(`(?m)^\s*Worktree:\s*(/\S+)\s*$`)
+
+// worktreeOf is the worktree a task names, if it names one that is a directory.
+func worktreeOf(task string) (string, bool) {
+	found := worktreeLine.FindStringSubmatch(task)
+	if found == nil {
+		return "", false
+	}
+	if info, err := os.Stat(found[1]); err != nil || !info.IsDir() {
+		return "", false
+	}
+	return filepath.Clean(found[1]), true
+}
+
 type server struct {
 	d   *devin
 	cwd string
@@ -181,6 +198,7 @@ func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort
 	mux.HandleFunc("GET /v1/models", s.models)
 	mux.HandleFunc("POST /v1/chat/completions", s.complete)
 	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, serveTools, s.call) })
+	mux.HandleFunc("/mcp/subagents", serveSubagents)
 	mux.Handle("/mcp/permissions", s.rev)
 	mux.HandleFunc("GET /limit", s.limit)
 	mux.HandleFunc("GET /status", s.status)
@@ -253,6 +271,9 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	cwd := s.cwd
 	if found := workingDirectory.FindStringSubmatch(system.String()); found != nil {
 		cwd = found[1]
+	}
+	if worktree, named := worktreeOf(users[0]); named {
+		cwd = worktree
 	}
 	key := req.Header.Get("x-opencode-session-id")
 	if key == "" {

@@ -82,3 +82,17 @@ func TestAMessageNeedsATaskInATurn(t *testing.T) {
 		}
 	}
 }
+
+func TestATaskNamesItsWorktree(t *testing.T) {
+	dir := t.TempDir()
+	task := "You are a subagent spawned by another session.\n\nWorktree: " + dir + "\n\nRebase and bench."
+	if got, named := worktreeOf(task); !named || got != dir {
+		t.Errorf("read %q, %v", got, named)
+	}
+	if _, named := worktreeOf("Worktree: /no/such/dir\nfix it"); named {
+		t.Error("a worktree that is not a directory was taken")
+	}
+	if _, named := worktreeOf("look at the worktree: /tmp too"); named {
+		t.Error("a mention in passing was taken")
+	}
+}

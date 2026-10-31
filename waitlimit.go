@@ -1,15 +1,9 @@
 package main
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
-	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
 	"time"
 )
 
@@ -48,45 +42,4 @@ func runWaitLimit(args []string) {
 		state.Until.Local().Format("Jan 2 15:04"), until.Local().Format("Jan 2 15:04"), time.Until(until).Round(time.Minute))
 	time.Sleep(time.Until(until))
 	fmt.Println("Devin's rate limit has lifted. Go on with the work, starting again the Devin tasks the limit stopped.")
-}
-
-// compactSession asks the OpenCode server this machine runs to compact a session.
-func compactSession(session string) error {
-	if session == "" {
-		return fmt.Errorf("OPENCODE_SESSION_ID is not set: not run by OpenCode")
-	}
-	state, _ := os.UserHomeDir()
-	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
-		state = dir
-	} else {
-		state = filepath.Join(state, ".local", "state")
-	}
-	raw, err := os.ReadFile(filepath.Join(state, "opencode", "service.json"))
-	if err != nil {
-		return fmt.Errorf("no OpenCode server found: %w", err)
-	}
-	var service struct {
-		URL      string `json:"url"`
-		Password string `json:"password"`
-	}
-	if err := json.Unmarshal(raw, &service); err != nil {
-		return err
-	}
-	request, _ := http.NewRequest(http.MethodPost, service.URL+"/api/session/"+url.PathEscape(session)+"/compact", bytes.NewReader([]byte("{}")))
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte("opencode:"+service.Password)))
-	if cwd, err := os.Getwd(); err == nil {
-		request.Header.Set("x-opencode-directory", url.PathEscape(cwd))
-	}
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode >= 300 {
-		var message [300]byte
-		n, _ := response.Body.Read(message[:])
-		return fmt.Errorf("%s: %s", response.Status, message[:n])
-	}
-	return nil
 }

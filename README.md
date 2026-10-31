@@ -105,6 +105,14 @@ each with the last thing it did), `peek_task` (a task's latest lines), `message_
 `claude-devin-acp status [-f] [-n lines] [session]` shows the same from a shell, as over SSH: the
 tasks, or what one has done, followed with `-f`.
 
+OpenCode's own subagents, on any model but Devin (DeepSeek while Devin is rate limited), get the
+same four tools at `/mcp/subagents`, through OpenCode's server API (found in
+`~/.local/state/opencode/service.json`): `message_task` steers one at its next step, or at once
+with `interrupt`, and `stop_task` interrupts one that has not reported in time.
+
+A Devin task whose prompt has a line `Worktree: /abs/path` opens its Devin session in that worktree,
+since OpenCode's subagent tool takes no directory and a subagent otherwise runs where its parent does.
+
 Steering: OpenCode holds a message for a busy subagent until its step ends, and a step here is
 Devin's whole turn. So the server is also an MCP server at `/mcp`, whose `message_task` takes the
 subagent's session id and a message and hands it to Devin at once; Devin takes it as the user
