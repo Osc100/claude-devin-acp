@@ -2,11 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // The recorded Devin session — one subagent started, two files read — as `serve` streams it:
@@ -72,14 +75,32 @@ func TestTheModelSaysTheEffort(t *testing.T) {
 }
 
 // A message reaches only a Devin that is in a turn; otherwise Claude is told where it went wrong.
+// Called as OpenCode calls it, through an MCP client.
 func TestAMessageNeedsATaskInATurn(t *testing.T) {
 	s := &server{sessions: map[string]*served{"ses_done": {r: &run{}}}}
+	ctx := context.Background()
+	clientSide, serverSide := mcp.NewInMemoryTransports()
+	if _, err := s.devinTools().Connect(ctx, serverSide, nil); err != nil {
+		t.Fatal(err)
+	}
+	client, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, clientSide, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
 	for session, want := range map[string]string{"ses_none": "no Devin task", "ses_done": "continue it with the subagent tool"} {
-		result := s.call(map[string]any{"name": "message_task", "arguments": map[string]any{"sessionID": session, "message": "stop"}})
-		text := result["content"].([]any)[0].(map[string]any)["text"].(string)
-		if result["isError"] != true || !strings.Contains(text, want) {
-			t.Errorf("%s: %v", session, result)
+		result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "message_task", Arguments: map[string]any{"sessionID": session, "message": "stop"}})
+		if err != nil {
+			t.Fatal(err)
 		}
+		if text := result.Content[0].(*mcp.TextContent).Text; !result.IsError || !strings.Contains(text, want) {
+			t.Errorf("%s: %v %q", session, result.IsError, text)
+		}
+	}
+	// What a tool requires is checked before it runs.
+	result, err := client.CallTool(ctx, &mcp.CallToolParams{Name: "message_task", Arguments: map[string]any{"sessionID": "ses_done"}})
+	if err == nil && !result.IsError {
+		t.Error("a message_task without a message was taken")
 	}
 }
 

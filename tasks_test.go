@@ -172,7 +172,7 @@ func TestATaskOverTheLimitIsToldToWait(t *testing.T) {
 
 // Sessions told the same reset time go on resumeSpacing apart, and one waiting later is not held back.
 func TestRateLimitedSessionsGoOnApart(t *testing.T) {
-	d := newDevin(nil, nil)
+	d := newDevin(nil)
 	reset := time.Date(2026, 10, 30, 6, 45, 0, 0, time.UTC)
 	for i := range 5 {
 		if got, want := d.resumeSlot(reset), reset.Add(time.Duration(i)*resumeSpacing); !got.Equal(want) {

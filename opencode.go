@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -15,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // OpenCode's own subagents, which run any model but Devin (DeepSeek, say, while Devin is rate
@@ -74,12 +78,16 @@ func opencodeCall(method, path string, body any, into any) error {
 	return json.Unmarshal(wrapped.Data, into)
 }
 
-// compactSession asks OpenCode to compact a session, at its next step boundary.
-func compactSession(session string) error {
-	if session == "" {
-		return fmt.Errorf("OPENCODE_SESSION_ID is not set: not run by OpenCode")
+// compact is `POST /compact/{session}`: has OpenCode compact a session, at its next step boundary.
+// For wait-limit, which runs in an agent's sandbox, away from OpenCode's password; naming the
+// session is what it takes, and OpenCode gives a session's id only to the commands it runs.
+func compact(w http.ResponseWriter, r *http.Request) {
+	session := r.PathValue("session")
+	if err := opencodeCall(http.MethodPost, "/api/session/"+url.PathEscape(session)+"/compact", map[string]any{}, nil); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
 	}
-	return opencodeCall(http.MethodPost, "/api/session/"+url.PathEscape(session)+"/compact", map[string]any{}, nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // ocSession is a session as OpenCode's API gives it.
@@ -197,129 +205,100 @@ func sessionLines(id string, messages int) ([]string, error) {
 	return lines, nil
 }
 
-const subagentTools = `[{
-  "name": "task_status",
-  "title": "List OpenCode subagents",
-  "description": "List OpenCode's own subagents (any model but Devin, such as DeepSeek) running now and those finished in the last hour: each one's sessionID, title, model, how long it has been working (or since it finished), and the last thing it did. A quick check that needs no waiting; use peek_task for more of one.",
-  "inputSchema": {"type": "object", "properties": {}}
-}, {
-  "name": "peek_task",
-  "title": "Peek at an OpenCode subagent",
-  "description": "Return the latest of what an OpenCode subagent has said and done, running or finished: its text, a line for each tool call, and the messages it was sent, oldest first. To see whether it is on track before steering it with message_task.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent's session, as the subagent tool gave it."},
-      "lines": {"type": "number", "description": "How many of the latest lines to return. Default 40, at most 200."}
-    },
-    "required": ["sessionID"]
-  }
-}, {
-  "name": "message_task",
-  "title": "Message a running OpenCode subagent",
-  "description": "Send a message to an OpenCode subagent while it works, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. It reads the message at its next step, once its current tool call returns; interrupt cuts that call short (a long build or bench) so it reads the message at once. Only for a subagent still running; a finished one is continued with the subagent tool and its sessionID.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent's session."},
-      "message": {"type": "string", "description": "What to tell it."},
-      "interrupt": {"type": "boolean", "description": "Cut its current tool call short so it reads the message at once. Default false."}
-    },
-    "required": ["sessionID", "message"]
-  }
-}, {
-  "name": "stop_task",
-  "title": "Stop an OpenCode subagent",
-  "description": "Tell a running OpenCode subagent to stop now and report what it did, what is left, and the state it leaves things in; it is interrupted if it has not finished within timeout_seconds. Its report is its reply to the subagent call.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent's session."},
-      "timeout_seconds": {"type": "number", "description": "How long it has to wrap up before it is interrupted. Default 60."}
-    },
-    "required": ["sessionID"]
-  }
-}]`
-
-func serveSubagents(w http.ResponseWriter, r *http.Request) {
-	serveMCP(w, r, subagentTools, callSubagents)
-}
-
-func callSubagents(params map[string]any) map[string]any {
-	name, _ := params["name"].(string)
-	args, _ := params["arguments"].(map[string]any)
-	if name == "task_status" {
-		text, err := subagentStatus()
-		if err != nil {
-			return toolResult(err.Error(), true)
-		}
-		return toolResult(text, false)
-	}
-	id, _ := args["sessionID"].(string)
+// subagentOf is a session that is one of OpenCode's own subagents, and whether it is running now.
+func subagentOf(id string) (ocSession, bool, error) {
 	session, err := getSession(id)
 	if err != nil {
-		return toolResult("no OpenCode session "+id+": "+err.Error(), true)
+		return session, false, fmt.Errorf("no OpenCode session %s: %w", id, err)
 	}
 	if !session.subagent() {
-		return toolResult("session "+id+" is not one of OpenCode's own subagents (a Devin subagent is watched through the devin MCP server)", true)
+		return session, false, fmt.Errorf("session %s is not one of OpenCode's own subagents (a Devin subagent is watched through the devin MCP server)", id)
 	}
 	running, err := activeSessions()
-	if err != nil {
-		return toolResult(err.Error(), true)
-	}
-	switch name {
-	case "peek_task":
-		n := 40
-		if lines, ok := args["lines"].(float64); ok && lines > 0 {
-			n = min(int(lines), 200)
-		}
-		lines, err := sessionLines(id, 30)
-		if err != nil {
-			return toolResult(err.Error(), true)
-		}
-		if len(lines) > n {
-			lines = lines[len(lines)-n:]
-		}
-		return toolResult(describeSubagent(session, running[id], "")+"\n\n"+strings.Join(lines, "\n"), false)
-	case "message_task":
-		message, _ := args["message"].(string)
-		if strings.TrimSpace(message) == "" {
-			return toolResult("message is required", true)
-		}
-		if !running[id] {
-			return toolResult("session "+id+" is not running now; continue it with the subagent tool and this sessionID", true)
-		}
-		interrupt, _ := args["interrupt"].(bool)
-		if err := steerSubagent(id, message, interrupt); err != nil {
-			return toolResult(err.Error(), true)
-		}
-		log.Printf("steered OpenCode subagent %s (interrupt %v)", id, interrupt)
-		return toolResult("The subagent has the message and reads it at its next step; its reply to the subagent call covers what it does then.", false)
-	case "stop_task":
-		if !running[id] {
-			return toolResult("session "+id+" is not running now", true)
-		}
-		timeout := 60.0
-		if seconds, ok := args["timeout_seconds"].(float64); ok && seconds > 0 {
-			timeout = seconds
-		}
-		if err := steerSubagent(id, stopMessage, false); err != nil {
-			return toolResult(err.Error(), true)
-		}
-		go func() {
-			deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
-			for time.Now().Before(deadline) {
-				time.Sleep(5 * time.Second)
-				if running, err := activeSessions(); err == nil && !running[id] {
-					return
-				}
+	return session, running[id], err
+}
+
+// subagentTools are the tools that watch and steer OpenCode's own subagents (`/mcp/subagents`).
+func subagentTools() *mcp.Server {
+	server := newMCP("subagents")
+	mcp.AddTool(server, &mcp.Tool{Name: "task_status", Title: "List OpenCode subagents",
+		Description: "List OpenCode's own subagents (any model but Devin, such as DeepSeek) running now and those finished in the last hour: each one's sessionID, title, model, how long it has been working (or since it finished), and the last thing it did. A quick check that needs no waiting; use peek_task for more of one."},
+		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, any, error) {
+			text, err := subagentStatus()
+			if err != nil {
+				return nil, nil, err
 			}
-			log.Printf("OpenCode subagent %s did not stop within %vs; interrupting it", id, timeout)
-			_ = opencodeCall(http.MethodPost, "/api/session/"+url.PathEscape(id)+"/interrupt", nil, nil)
-		}()
-		return toolResult("The subagent is told to stop and report; its report is its reply to the subagent call. It is interrupted if it has not finished in "+strconv.Itoa(int(timeout))+"s.", false)
+			return said(text)
+		})
+	mcp.AddTool(server, &mcp.Tool{Name: "peek_task", Title: "Peek at an OpenCode subagent",
+		Description: "Return the latest of what an OpenCode subagent has said and done, running or finished: its text, a line for each tool call, and the messages it was sent, oldest first. To see whether it is on track before steering it with message_task."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a peekArgs) (*mcp.CallToolResult, any, error) {
+			session, running, err := subagentOf(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			lines, err := sessionLines(a.SessionID, 30)
+			if err != nil {
+				return nil, nil, err
+			}
+			if n := a.peekLines(); len(lines) > n {
+				lines = lines[len(lines)-n:]
+			}
+			return said(describeSubagent(session, running, "") + "\n\n" + strings.Join(lines, "\n"))
+		})
+	type messageArgs struct {
+		SessionID string `json:"sessionID" jsonschema:"The subagent's session, as the subagent tool gave it."`
+		Message   string `json:"message" jsonschema:"What to tell it."`
+		Interrupt bool   `json:"interrupt,omitempty" jsonschema:"Cut its current tool call short so it reads the message at once. Default false."`
 	}
-	return toolResult("no tool "+name, true)
+	mcp.AddTool(server, &mcp.Tool{Name: "message_task", Title: "Message a running OpenCode subagent",
+		Description: "Send a message to an OpenCode subagent while it works, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. It reads the message at its next step, once its current tool call returns; interrupt cuts that call short (a long build or bench) so it reads the message at once. Only for a subagent still running; a finished one is continued with the subagent tool and its sessionID."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a messageArgs) (*mcp.CallToolResult, any, error) {
+			if strings.TrimSpace(a.Message) == "" {
+				return nil, nil, errors.New("message is required")
+			}
+			_, running, err := subagentOf(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !running {
+				return nil, nil, fmt.Errorf("session %s is not running now; continue it with the subagent tool and this sessionID", a.SessionID)
+			}
+			if err := steerSubagent(a.SessionID, a.Message, a.Interrupt); err != nil {
+				return nil, nil, err
+			}
+			log.Printf("steered OpenCode subagent %s (interrupt %v)", a.SessionID, a.Interrupt)
+			return said("The subagent has the message and reads it at its next step; its reply to the subagent call covers what it does then.")
+		})
+	mcp.AddTool(server, &mcp.Tool{Name: "stop_task", Title: "Stop an OpenCode subagent",
+		Description: "Tell a running OpenCode subagent to stop now and report what it did, what is left, and the state it leaves things in; it is interrupted if it has not finished within timeout_seconds. Its report is its reply to the subagent call."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a stopArgs) (*mcp.CallToolResult, any, error) {
+			id := a.SessionID
+			_, running, err := subagentOf(id)
+			if err != nil {
+				return nil, nil, err
+			}
+			if !running {
+				return nil, nil, fmt.Errorf("session %s is not running now", id)
+			}
+			if err := steerSubagent(id, stopMessage, false); err != nil {
+				return nil, nil, err
+			}
+			timeout := a.timeout()
+			go func() {
+				deadline := time.Now().Add(time.Duration(timeout * float64(time.Second)))
+				for time.Now().Before(deadline) {
+					time.Sleep(5 * time.Second)
+					if running, err := activeSessions(); err == nil && !running[id] {
+						return
+					}
+				}
+				log.Printf("OpenCode subagent %s did not stop within %vs; interrupting it", id, timeout)
+				_ = opencodeCall(http.MethodPost, "/api/session/"+url.PathEscape(id)+"/interrupt", nil, nil)
+			}()
+			return said("The subagent is told to stop and report; its report is its reply to the subagent call. It is interrupted if it has not finished in " + strconv.Itoa(int(timeout)) + "s.")
+		})
+	return server
 }
 
 // steerSubagent hands a running OpenCode session a message, delivered at its next step, and when

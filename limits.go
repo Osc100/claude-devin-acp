@@ -140,13 +140,13 @@ type keptLimit struct {
 }
 
 func limitStore() string {
-	cache, _ := os.UserCacheDir()
-	return filepath.Join(cache, "claude-devin-acp", "limit.json")
+	cache, _ := cacheDir()
+	return filepath.Join(cache, "limit.json")
 }
 
 func (d *devin) keepLimit(l limit) {
 	raw, _ := json.Marshal(keptLimit{l.until, l.message})
-	if err := os.WriteFile(limitStore(), raw, 0o644); err != nil {
+	if err := os.WriteFile(limitStore(), raw, 0o600); err != nil {
 		log.Printf("keeping the rate limit: %v", err)
 	}
 }

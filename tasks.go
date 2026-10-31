@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // What `serve` offers about the Devin turns it runs, beside the turns themselves: MCP tools at
@@ -159,49 +163,6 @@ func ago(at time.Time) string {
 	return time.Since(at).Round(time.Second).String()
 }
 
-const serveTools = `[{
-  "name": "message_task",
-  "title": "Message a running Devin task",
-  "description": "Send a message to Devin while it works on a task you gave it as a background subagent, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. Devin reads it at once, as an interruption, and its reply to the subagent call covers what it did after. Only for a task still running; a finished one is continued with the subagent tool and its sessionID.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent session Devin is working in, as the subagent tool gave it."},
-      "message": {"type": "string", "description": "What to tell Devin."}
-    },
-    "required": ["sessionID", "message"]
-  }
-}, {
-  "name": "task_status",
-  "title": "List Devin tasks",
-  "description": "List the Devin tasks running now and those finished in the last hour: each one's sessionID, title, directory, how long it has been working (or since it finished), and the last thing it did. A quick check that needs no waiting; use peek_task for more of one.",
-  "inputSchema": {"type": "object", "properties": {}}
-}, {
-  "name": "peek_task",
-  "title": "Peek at a Devin task",
-  "description": "Return the latest of what a Devin task has said and done, running or finished: its text and a line for each tool call, subagent and permission, oldest first. To see whether it is on track before steering it with message_task.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent session Devin is working in."},
-      "lines": {"type": "number", "description": "How many of the latest lines to return. Default 40, at most 200."}
-    },
-    "required": ["sessionID"]
-  }
-}, {
-  "name": "stop_task",
-  "title": "Stop a Devin task",
-  "description": "Tell a running Devin task to stop now and report what it did, what is left, and the state it leaves things in; its turn is cancelled if it has not finished within timeout_seconds. Its report is its reply to the subagent call. Unlike cancelling the subagent, the work done so far is reported, not lost.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "sessionID": {"type": "string", "description": "The subagent session Devin is working in."},
-      "timeout_seconds": {"type": "number", "description": "How long Devin has to wrap up before its turn is cancelled. Default 60."}
-    },
-    "required": ["sessionID"]
-  }
-}]`
-
 // steered is the update a turn's watcher is handed for a message given to Devin mid-turn, and
 // stopAsked the one for being told to stop.
 const (
@@ -213,70 +174,82 @@ const (
 
 const stopMessage = "Stop now. Do not start anything new; finish or undo only what would otherwise leave files broken. Then reply with a report: what you did, what is left, and the state you are leaving things in."
 
-func (s *server) call(params map[string]any) map[string]any {
-	name, _ := params["name"].(string)
-	args, _ := params["arguments"].(map[string]any)
-	if name == "task_status" {
-		tasks := s.tasks(time.Hour)
-		if len(tasks) == 0 {
-			return toolResult("no Devin tasks running or finished in the last hour", false)
-		}
-		described := make([]string, len(tasks))
-		for i, t := range tasks {
-			described[i] = t.String()
-		}
-		return toolResult(strings.Join(described, "\n\n"), false)
-	}
-	session, _ := args["sessionID"].(string)
-	conversation, err := s.find(session)
-	if err != nil {
-		return toolResult(err.Error(), true)
-	}
-	switch name {
-	case "peek_task":
-		n := 40
-		if lines, ok := args["lines"].(float64); ok && lines > 0 {
-			n = min(int(lines), 200)
-		}
-		lines, _ := conversation.act.since(0, true)
-		if len(lines) > n {
-			lines = lines[len(lines)-n:]
-		}
-		s.mu.Lock()
-		t := s.taskOf(conversation)
-		s.mu.Unlock()
-		return toolResult(t.String()+"\n\n"+strings.Join(lines, "\n"), false)
-	case "message_task":
-		message, _ := args["message"].(string)
-		if strings.TrimSpace(message) == "" {
-			return toolResult("message is required", true)
-		}
-		if err := s.steer(conversation, message, map[string]any{"sessionUpdate": steered, "message": message}); err != nil {
-			return toolResult(err.Error(), true)
-		}
-		return toolResult("Devin has the message and is going on with it; its reply to the subagent call covers what it does now.", false)
-	case "stop_task":
-		timeout := 60.0
-		if seconds, ok := args["timeout_seconds"].(float64); ok && seconds > 0 {
-			timeout = seconds
-		}
-		if err := s.steer(conversation, stopMessage, map[string]any{"sessionUpdate": stopAsked}); err != nil {
-			return toolResult(err.Error(), true)
-		}
-		s.mu.Lock()
-		ended, r := conversation.turnEnded, conversation.r
-		s.mu.Unlock()
-		go func() {
-			select {
-			case <-ended:
-			case <-time.After(time.Duration(timeout * float64(time.Second))):
-				log.Printf("%s did not stop within %vs; cancelling its turn", r.devinSession, timeout)
-				s.d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
+// devinTools are the tools that watch and steer Devin's tasks (`/mcp`).
+func (s *server) devinTools() *mcp.Server {
+	server := newMCP("devin")
+	mcp.AddTool(server, &mcp.Tool{Name: "task_status", Title: "List Devin tasks",
+		Description: "List the Devin tasks running now and those finished in the last hour: each one's sessionID, title, directory, how long it has been working (or since it finished), and the last thing it did. A quick check that needs no waiting; use peek_task for more of one."},
+		func(context.Context, *mcp.CallToolRequest, struct{}) (*mcp.CallToolResult, any, error) {
+			tasks := s.tasks(time.Hour)
+			if len(tasks) == 0 {
+				return said("no Devin tasks running or finished in the last hour")
 			}
-		}()
-		return toolResult("Devin is told to stop and report; its report is its reply to the subagent call. Its turn is cancelled if it has not finished in "+strconv.Itoa(int(timeout))+"s.", false)
+			described := make([]string, len(tasks))
+			for i, t := range tasks {
+				described[i] = t.String()
+			}
+			return said(strings.Join(described, "\n\n"))
+		})
+	mcp.AddTool(server, &mcp.Tool{Name: "peek_task", Title: "Peek at a Devin task",
+		Description: "Return the latest of what a Devin task has said and done, running or finished: its text and a line for each tool call, subagent and permission, oldest first. To see whether it is on track before steering it with message_task."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a peekArgs) (*mcp.CallToolResult, any, error) {
+			conversation, err := s.find(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			lines, _ := conversation.act.since(0, true)
+			if n := a.peekLines(); len(lines) > n {
+				lines = lines[len(lines)-n:]
+			}
+			s.mu.Lock()
+			t := s.taskOf(conversation)
+			s.mu.Unlock()
+			return said(t.String() + "\n\n" + strings.Join(lines, "\n"))
+		})
+	type messageArgs struct {
+		SessionID string `json:"sessionID" jsonschema:"The subagent's session, as the subagent tool gave it."`
+		Message   string `json:"message" jsonschema:"What to tell Devin."`
 	}
-	return toolResult("no tool "+name, true)
+	mcp.AddTool(server, &mcp.Tool{Name: "message_task", Title: "Message a running Devin task",
+		Description: "Send a message to Devin while it works on a task you gave it as a background subagent, without waiting for it to finish: to correct it, narrow or widen the task, add what you have learned, or tell it to stop and report. Devin reads it at once, as an interruption, and its reply to the subagent call covers what it did after. Only for a task still running; a finished one is continued with the subagent tool and its sessionID."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a messageArgs) (*mcp.CallToolResult, any, error) {
+			conversation, err := s.find(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if strings.TrimSpace(a.Message) == "" {
+				return nil, nil, errors.New("message is required")
+			}
+			if err := s.steer(conversation, a.Message, map[string]any{"sessionUpdate": steered, "message": a.Message}); err != nil {
+				return nil, nil, err
+			}
+			return said("Devin has the message and is going on with it; its reply to the subagent call covers what it does now.")
+		})
+	mcp.AddTool(server, &mcp.Tool{Name: "stop_task", Title: "Stop a Devin task",
+		Description: "Tell a running Devin task to stop now and report what it did, what is left, and the state it leaves things in; its turn is cancelled if it has not finished within timeout_seconds. Its report is its reply to the subagent call. Unlike cancelling the subagent, the work done so far is reported, not lost."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a stopArgs) (*mcp.CallToolResult, any, error) {
+			conversation, err := s.find(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := s.steer(conversation, stopMessage, map[string]any{"sessionUpdate": stopAsked}); err != nil {
+				return nil, nil, err
+			}
+			timeout := a.timeout()
+			s.mu.Lock()
+			ended, r := conversation.turnEnded, conversation.r
+			s.mu.Unlock()
+			go func() {
+				select {
+				case <-ended:
+				case <-time.After(time.Duration(timeout * float64(time.Second))):
+					log.Printf("%s did not stop within %vs; cancelling its turn", r.devinSession, timeout)
+					s.d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
+				}
+			}()
+			return said("Devin is told to stop and report; its report is its reply to the subagent call. Its turn is cancelled if it has not finished in " + strconv.Itoa(int(timeout)) + "s.")
+		})
+	return server
 }
 
 // steer hands Devin a message in the middle of a conversation's turn, and the turn's watcher the

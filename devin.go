@@ -1,9 +1,6 @@
 package main
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -20,22 +16,21 @@ import (
 // Devin's dialect, as its CLI 3000.11.234 speaks it (captured 2026-10-30):
 //
 //   - It reports its subagents only to a client whose `clientCapabilities._meta` holds
-//     `cognition.ai/subagentSupport` and `cognition.ai/subagentControl`, both `true`; the RFD's
-//     `clientCapabilities.subagents` is ignored.
+//     `cognition.ai/subagentSupport` and `cognition.ai/subagentControl`, both `true`.
 //   - A subagent's whole run is streamed on the parent's own session id. Every update of it
 //     carries `_meta["cognition.ai/subagent_context"].parentAgentId`, which despite its name is
 //     the id of the agent the update belongs to; Devin's top agent is "root".
 //   - A subagent starts with a `tool_call_update` whose toolCallId is its agent id, carrying
 //     `cognition.ai/subagent_started` {agentId, title, task, profile, depth}, and ends with
-//     `cognition.ai/subagent_completed` {agentId, success, summary}. Neither is a tool call the
-//     editor was told of, so both are turned into the RFD's own messages and not passed on.
+//     `cognition.ai/subagent_completed` {agentId, success, summary}. A reply says each as a line
+//     (`serve.go`).
 const (
 	metaContext   = "cognition.ai/subagent_context"
 	metaStarted   = "cognition.ai/subagent_started"
 	metaCompleted = "cognition.ai/subagent_completed"
 	rootAgent     = "root"
 	// permissionRefused is the update a run's watcher is handed for a permission Devin asked
-	// for with no editor to ask: not one of Devin's own.
+	// for with nobody to decide it: not one of Devin's own.
 	permissionRefused = "_permission_refused"
 	// permissionReviewed is the one handed for a permission the reviewer decided.
 	permissionReviewed = "_permission_reviewed"
@@ -45,18 +40,9 @@ const (
 	thinkingDone = "_thinking_done"
 )
 
-// forwarded are the updates of a Devin session that make sense in a child's transcript. Its mode,
-// its commands, its configuration and its usage are Devin's own and would be taken as the child's
-// settings by the editor.
-var forwarded = map[string]bool{
-	"agent_message_chunk": true, "agent_thought_chunk": true, "user_message_chunk": true,
-	"tool_call": true, "tool_call_update": true, "plan": true,
-}
-
 // devin is the one Devin process every run shares, started on the first run.
 type devin struct {
 	args []string
-	p    *proxy
 
 	mu      sync.Mutex
 	in      *wire
@@ -80,7 +66,7 @@ type devin struct {
 	longLimit limit
 	// lastResume is when the last session waiting out a rate limit is to go on (`resumeSlot`).
 	lastResume time.Time
-	// reviewer, when set, decides the permissions Devin asks for with no editor to ask (`serve`).
+	// reviewer, when set, decides the permissions Devin asks for.
 	reviewer *reviewer
 }
 
@@ -179,27 +165,22 @@ func (d *devin) open(r *run) error {
 	return nil
 }
 
-func newDevin(args []string, p *proxy) *devin {
-	return &devin{args: args, p: p, pending: map[string]chan map[string]any{}, runs: map[string]*run{}}
+func newDevin(args []string) *devin {
+	return &devin{args: args, pending: map[string]chan map[string]any{}, runs: map[string]*run{}}
 }
 
-// run is one Devin session, shown to the editor as a child of the Claude session that asked for
-// it, its subagents as the child's children.
+// run is one Devin session: a conversation of OpenCode's (`serve.go`).
 type run struct {
-	parent, child, devinSession string
-	shown                       bool
+	devinSession string
 
-	mu     sync.Mutex
-	agents map[string]string // Devin's agent id → the editor's session id for it
-	answer strings.Builder   // what Devin's top agent said this turn, which goes back to Claude
-	broken bool              // whether Devin did something else since `answer` last grew
-	title  string            // the label of its latest turn
-	task   string            // what it was first asked, which the permission reviewer is told
+	mu sync.Mutex
+	// task is what it was first asked, which the permission reviewer is told.
+	task string
 	// calls are its tool calls in progress as Devin described them, by id: a permission request
 	// names only the call's id.
 	calls map[string]map[string]any
 	// watch, when set, is handed every update of the run with the agent it belongs to, before
-	// anything else is done with it: how `serve` streams a run to a client that is no editor.
+	// anything else is done with it: how a turn is streamed back.
 	watch func(owner string, update map[string]any)
 	// cwd is the directory its session was opened in, which loading it again names.
 	cwd string
@@ -209,23 +190,6 @@ type run struct {
 	// effort is the thinking its session was last set to, empty when it is not known to be set
 	// (a new process, a session loaded again).
 	effort string
-
-	// Its latest turn: done is closed when it ends, outcome and failure are then what it said
-	// and what went wrong.
-	done     chan struct{}
-	finished bool
-	outcome  string
-	failure  error
-	prompts  int
-}
-
-func (r *run) sessionOf(agent string) string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if session, ok := r.agents[agent]; ok {
-		return session
-	}
-	return r.child
 }
 
 func (d *devin) start() error {
@@ -262,7 +226,7 @@ func (d *devin) start() error {
 	d.proc = cmd.Process
 	d.mu.Unlock()
 	go func() {
-		d.p.pump(stdout, d.fromDevin)
+		pump(stdout, d.fromDevin)
 		_ = cmd.Wait()
 		d.mu.Lock()
 		d.ready, d.in, d.proc = nil, nil, nil
@@ -296,15 +260,10 @@ func (d *devin) start() error {
 }
 
 // devinLog is where Devin's own log goes: it writes a great deal to stderr, which would bury the
-// editor's log of this agent.
+// server's own log.
 func devinLog() *os.File {
-	dir, err := os.UserCacheDir()
-	if err == nil {
-		dir = filepath.Join(dir, "claude-devin-acp")
-		err = os.MkdirAll(dir, 0o755)
-	}
-	if err == nil {
-		if f, err := os.OpenFile(filepath.Join(dir, "devin.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644); err == nil {
+	if dir, err := cacheDir(); err == nil {
+		if f, err := os.OpenFile(filepath.Join(dir, "devin.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
 			return f
 		}
 	}
@@ -391,7 +350,7 @@ func (d *devin) fromDevin(line []byte) {
 	// Devin's `_cognition.ai/*` notifications are its own and go nowhere.
 }
 
-// tell hands the watcher of the run a notification of Devin's names an update of the proxy's own.
+// tell hands the watcher of the run a notification of Devin's names an update of the server's own.
 func (d *devin) tell(params, update map[string]any) {
 	devinSession, _ := params["sessionId"].(string)
 	r := d.runOf(devinSession)
@@ -421,8 +380,8 @@ func ownerOf(meta map[string]any) string {
 	return rootAgent
 }
 
-// update translates one of Devin's session updates for the run it belongs to (looked up when r is
-// nil): a subagent's start and end become the RFD's announcements, and its traffic its own session.
+// update hands one of Devin's session updates to the watcher of the run it belongs to (looked up
+// when r is nil), after noting the tool call it describes.
 func (d *devin) update(params map[string]any, r *run) {
 	devinSession, _ := params["sessionId"].(string)
 	if r == nil {
@@ -433,7 +392,6 @@ func (d *devin) update(params map[string]any, r *run) {
 		return
 	}
 	meta, _ := update["_meta"].(map[string]any)
-	owner := ownerOf(meta)
 	r.mu.Lock()
 	watch, replaying := r.watch, r.replaying
 	r.mu.Unlock()
@@ -444,60 +402,7 @@ func (d *devin) update(params map[string]any, r *run) {
 		r.noteCall(update)
 	}
 	if watch != nil {
-		watch(owner, update)
-	}
-	if started, _ := meta[metaStarted].(map[string]any); started != nil {
-		agent, _ := started["agentId"].(string)
-		title, _ := started["title"].(string)
-		task, _ := started["task"].(string)
-		profile, _ := started["profile"].(string)
-		parent := r.sessionOf(owner)
-		session := r.child + "/" + agent
-		r.mu.Lock()
-		r.agents[agent] = session
-		r.mu.Unlock()
-		if r.shown {
-			// Devin has a way to stop one subagent (`subagentControl`), but not one this proxy
-			// has seen used, so no Stop is offered for them.
-			d.p.announce(parent, session, title, "Devin subagent ("+profile+")", false, task, session+":task")
-		}
-		return
-	}
-	if completed, _ := meta[metaCompleted].(map[string]any); completed != nil {
-		agent, _ := completed["agentId"].(string)
-		success, _ := completed["success"].(bool)
-		session := r.sessionOf(agent)
-		if r.shown && session != r.child {
-			parent := r.parentOf(session)
-			if success {
-				d.p.state(parent, session, idle("end_turn", ""))
-			} else {
-				summary, _ := completed["summary"].(string)
-				d.p.state(parent, session, idle("error", summary))
-			}
-		}
-		return
-	}
-	kind, _ := update["sessionUpdate"].(string)
-	if owner == rootAgent && forwarded[kind] {
-		r.mu.Lock()
-		if kind != "agent_message_chunk" {
-			// Anything between two stretches of text (a thought, a tool call) ends a message;
-			// without a break, the next one runs on from the last one's final word.
-			r.broken = true
-		} else if content, _ := update["content"].(map[string]any); content != nil {
-			if text, _ := content["text"].(string); text != "" {
-				if r.broken && r.answer.Len() > 0 {
-					r.answer.WriteString("\n\n")
-				}
-				r.broken = false
-				r.answer.WriteString(text)
-			}
-		}
-		r.mu.Unlock()
-	}
-	if r.shown && forwarded[kind] {
-		d.p.notify(r.sessionOf(owner), update)
+		watch(ownerOf(meta), update)
 	}
 }
 
@@ -545,17 +450,8 @@ func (r *run) callOf(asked map[string]any) map[string]any {
 	return call
 }
 
-// parentOf is the editor session a nested child was announced under: everything up to its last
-// `/`, since a child's id is its parent's id and its own Devin agent id.
-func (r *run) parentOf(session string) string {
-	if i := strings.LastIndex(session, "/"); i > 0 {
-		return session[:i]
-	}
-	return r.parent
-}
-
-// askPermission passes a permission Devin asks for to the editor, as asked by the child whose tool
-// call it is, and passes the editor's answer back.
+// askPermission answers a permission Devin asks for: a call that only reads is allowed, any other
+// is decided by the permission reviewer, and with no reviewer it is refused.
 func (d *devin) askPermission(msg map[string]any) {
 	params, _ := msg["params"].(map[string]any)
 	devinSession, _ := params["sessionId"].(string)
@@ -569,7 +465,7 @@ func (d *devin) askPermission(msg map[string]any) {
 	asked, _ := params["toolCall"].(map[string]any)
 	call := r.callOf(asked)
 	meta, _ := call["_meta"].(map[string]any)
-	if v := d.reviewer; d.p.editor == nil && v != nil {
+	if v := d.reviewer; v != nil {
 		if !v.is(devinSession) {
 			if readOnly(call) {
 				// Only reads: allowed without asking, and without a word to anyone.
@@ -598,32 +494,16 @@ func (d *devin) askPermission(msg map[string]any) {
 		raw, _ := json.Marshal(params)
 		log.Printf("refusing the permission reviewer's own request: %.1500s", raw)
 	}
-	if d.p.editor == nil {
-		// No editor, so nobody to ask (`serve`), or it is the reviewer's own: refused, and the
-		// run's watcher is told.
-		reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}
-		d.reply(reply)
-		r.mu.Lock()
-		watch := r.watch
-		r.mu.Unlock()
-		if watch != nil {
-			title, _ := call["title"].(string)
-			watch(ownerOf(meta), map[string]any{"sessionUpdate": permissionRefused, "title": title})
-		}
-		return
-	}
-	target := r.parent
-	if r.shown {
-		target = r.sessionOf(ownerOf(meta))
-	}
-	params["sessionId"] = target
-	answer := d.p.ask("session/request_permission", params)
-	if result, ok := answer["result"]; ok {
-		reply["result"] = result
-	} else {
-		reply["error"] = answer["error"]
-	}
+	// Nobody to decide it, or it is the reviewer's own: refused, and the run's watcher is told.
+	reply["result"] = map[string]any{"outcome": map[string]any{"outcome": "cancelled"}}
 	d.reply(reply)
+	r.mu.Lock()
+	watch := r.watch
+	r.mu.Unlock()
+	if watch != nil {
+		title, _ := call["title"].(string)
+		watch(ownerOf(meta), map[string]any{"sessionUpdate": permissionRefused, "title": title})
+	}
 }
 
 // reviewed answers a permission request as the reviewer decided it, tells the run's watcher, and
@@ -658,230 +538,6 @@ func (d *devin) reviewed(id any, r *run, params, call map[string]any, v verdict)
 	}
 }
 
-// begin hands Devin a task in the run `cont` names, or in a new session, and returns the run at
-// once: Devin works in the background, its card running, and the run's turn is collected with
-// wait. Claude is never held on a call while Devin works, as Claude Code's own background agents
-// do not hold it.
-func (d *devin) begin(parent, task, title, cwd, cont, effort string) (*run, error) {
-	if err := d.start(); err != nil {
-		return nil, err
-	}
-	var r *run
-	if cont != "" {
-		d.p.mu.Lock()
-		r = d.p.children[cont]
-		d.p.mu.Unlock()
-		if r == nil || r.parent != parent {
-			return nil, fmt.Errorf("no Devin run %q in this session to continue", cont)
-		}
-		if err := d.open(r); err != nil {
-			return nil, err
-		}
-	} else {
-		if cwd == "" {
-			cwd = d.p.cwdOf(parent)
-		}
-		result, err := d.request("session/new", map[string]any{"cwd": cwd, "mcpServers": []any{}})
-		if err != nil {
-			return nil, err
-		}
-		devinSession, _ := result["sessionId"].(string)
-		if devinSession == "" {
-			return nil, errors.New("Devin opened no session")
-		}
-		r = &run{parent: parent, child: "devin:" + devinSession, devinSession: devinSession, cwd: cwd,
-			loaded: true, shown: d.p.showsSubagents(), agents: map[string]string{rootAgent: "devin:" + devinSession}}
-		d.mu.Lock()
-		d.runs[devinSession] = r
-		d.mu.Unlock()
-		d.p.mu.Lock()
-		d.p.children[r.child] = r
-		d.p.mu.Unlock()
-	}
-	if err := d.configure(r, effort); err != nil {
-		return nil, err
-	}
-	r.mu.Lock()
-	if r.done != nil && !r.finished {
-		r.mu.Unlock()
-		return nil, fmt.Errorf("Devin run %s is still working; wait for it before following up", r.child)
-	}
-	r.answer.Reset()
-	r.broken, r.finished, r.outcome, r.failure = false, false, "", nil
-	r.done = make(chan struct{})
-	r.prompts++
-	message := fmt.Sprintf("%s:prompt:%d", r.child, r.prompts)
-	r.title = title
-	if r.title == "" {
-		r.title = firstLine(task)
-	}
-	r.mu.Unlock()
-	if r.shown {
-		d.p.announce(parent, r.child, "Devin: "+r.title, "Devin CLI", true, task, message)
-	}
-	go d.turn(r, task)
-	return r, nil
-}
-
-// turn is one of Devin's turns in r, from the prompt to its end: the card's end, and the outcome
-// wait hands Claude.
-func (d *devin) turn(r *run, task string) {
-	d.busy()
-	defer d.rested()
-	result, err := d.prompt(context.Background(), r.devinSession, task, nil)
-	stop, _ := result["stopReason"].(string)
-	if err == nil && stop == "cancelled" {
-		err = errors.New("Devin's turn was cancelled")
-	}
-	if r.shown {
-		switch {
-		case stop == "cancelled":
-			d.p.state(r.parent, r.child, idle("cancelled", ""))
-		case err != nil:
-			d.p.state(r.parent, r.child, idle("error", err.Error()))
-		case stop == "":
-			d.p.state(r.parent, r.child, idle("end_turn", ""))
-		default:
-			d.p.state(r.parent, r.child, idle(stop, ""))
-		}
-	}
-	r.mu.Lock()
-	r.outcome = strings.TrimSpace(r.answer.String())
-	r.failure = err
-	r.finished = true
-	close(r.done)
-	r.mu.Unlock()
-}
-
-// report is what wait says of a run: its id and title, and its answer once its turn is over.
-func (r *run) report() string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	head := fmt.Sprintf("## %s (%s)", r.child, r.title)
-	switch {
-	case r.done == nil:
-		return head + ": never started"
-	case !r.finished:
-		return head + ": still working"
-	case r.failure != nil:
-		text := head + ": did not finish: " + r.failure.Error()
-		if r.outcome != "" {
-			text += "\n\nWhat it said before that:\n" + r.outcome
-		}
-		return text
-	case r.outcome == "":
-		return head + ": finished, without a message"
-	default:
-		return head + ": finished\n\n" + r.outcome
-	}
-}
-
-// runsOf are the runs of a Claude session that ids name, or all of them with none named.
-func (p *proxy) runsOf(parent string, ids []string) ([]*run, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	var runs []*run
-	if len(ids) == 0 {
-		for _, r := range p.children {
-			if r.parent == parent {
-				runs = append(runs, r)
-			}
-		}
-		sort.Slice(runs, func(i, j int) bool { return runs[i].child < runs[j].child })
-		return runs, nil
-	}
-	for _, id := range ids {
-		r := p.children[id]
-		if r == nil || r.parent != parent {
-			return nil, fmt.Errorf("no Devin run %q in this session", id)
-		}
-		runs = append(runs, r)
-	}
-	return runs, nil
-}
-
-// wait holds until every run is done, ctx ends or the timeout passes, whichever is first.
-func wait(ctx context.Context, runs []*run, timeout time.Duration) {
-	deadline := time.After(timeout)
-	for _, r := range runs {
-		r.mu.Lock()
-		done := r.done
-		r.mu.Unlock()
-		if done == nil {
-			continue
-		}
-		select {
-		case <-done:
-		case <-deadline:
-			return
-		case <-ctx.Done():
-			return
-		}
-	}
-}
-
-// cancelChild stops the Devin run the editor's child session is, and says whether the session was
-// one of the proxy's, which Claude must never be asked about.
-func (p *proxy) cancelChild(session string) bool {
-	if !strings.HasPrefix(session, "devin:") {
-		return false
-	}
-	p.mu.Lock()
-	r := p.children[session]
-	p.mu.Unlock()
-	if r != nil {
-		p.devin.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
-	}
-	return true
-}
-
-// announce tells the editor a child is running under parent, and lays the task down as a message
-// from the parent to it, in both transcripts: the editor draws the child's card where the
-// parent's message to it is.
-func (p *proxy) announce(parent, child, title, description string, cancellable bool, task, messageID string) {
-	capabilities := map[string]any{}
-	if cancellable {
-		capabilities["cancel"] = map[string]any{}
-	}
-	p.notify(parent, map[string]any{
-		"sessionUpdate": "subagent_update", "sessionId": child,
-		"title": title, "description": description,
-		"capabilities": capabilities, "state": map[string]any{"state": "running"},
-	})
-	message := map[string]any{
-		"sessionUpdate": "session_message", "messageId": messageID,
-		"senderSessionId": parent, "recipientSessionId": child,
-		"content": []any{map[string]any{"type": "text", "text": task}},
-	}
-	outgoing, incoming := clone(message), clone(message)
-	outgoing["recipientMessageId"] = messageID
-	incoming["senderMessageId"] = messageID
-	p.notify(parent, outgoing)
-	p.notify(child, incoming)
-}
-
-func (p *proxy) state(parent, child string, state map[string]any) {
-	p.notify(parent, map[string]any{"sessionUpdate": "subagent_update", "sessionId": child, "state": state})
-}
-
-// idle is the RFD's end of a child's work: `error` carries what went wrong, every other stop
-// reason only itself.
-func idle(stop, problem string) map[string]any {
-	state := map[string]any{"state": "idle", "stopReason": stop}
-	if stop == "error" && problem != "" {
-		state["error"] = map[string]any{"code": -32603, "message": problem}
-	}
-	return state
-}
-
-func clone(m map[string]any) map[string]any {
-	c := make(map[string]any, len(m))
-	for k, v := range m {
-		c[k] = v
-	}
-	return c
-}
-
 func firstLine(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
@@ -891,10 +547,4 @@ func firstLine(s string) string {
 		s = s[:57] + "..."
 	}
 	return s
-}
-
-func randomToken() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

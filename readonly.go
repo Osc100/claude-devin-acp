@@ -1,42 +1,57 @@
 package main
 
 import (
-	"path/filepath"
 	"regexp"
 	"strings"
+
+	"mvdan.cc/sh/v3/pattern"
+	"mvdan.cc/sh/v3/syntax"
 )
 
-// Read-only commands are allowed without the reviewer: a shell command each of whose parts (split
-// on ; && || | & and newlines) is a command that only reads, with nothing that writes or runs
+// Read-only commands are allowed without the reviewer: a shell command each of whose simple
+// commands (joined by ; && || | & and newlines) only reads, with nothing that writes or runs
 // something else. Devin asks for these when one part is missing from its own allow list, as in
 // `sleep 9; tail -4 log`, and they are most of what it asks for while it waits on a build.
+//
+// It is a narrow door, and anything it is unsure of goes to the reviewer instead. The command is
+// parsed as bash parses it (mvdan.cc/sh), and taken only when it is simple commands and nothing
+// else: each named bare (not a path, which could be a script of the same name), with no variable
+// before it (LESSOPEN=, LD_PRELOAD= and the like run code), no expansion ($, `, $(), <()), no
+// definitions, groups or subshells, redirects only to /dev/null or another descriptor, and no word
+// naming credentials. Commands that can write or run something with the right flag (sort -o, find
+// -exec, git's config hooks) are not here at all.
 
 // readers are the commands taken as only reading, each with the arguments that would make it do
 // more, refused.
 var readers = map[string][]string{
-	"cat": nil, "head": nil, "tail": nil, "less": nil, "wc": nil, "nl": nil, "tac": nil,
-	"ls": nil, "stat": nil, "file": nil, "du": nil, "df": nil, "tree": nil,
+	"cat": nil, "head": nil, "tail": nil, "wc": nil, "nl": nil, "tac": nil,
+	"ls": nil, "stat": nil, "du": nil, "df": nil,
+	"file": {"-C", "--compile"},
 	"grep": nil, "egrep": nil, "fgrep": nil,
-	"rg":     {"--pre", "--pre-glob"},
-	"fd":     {"-x", "--exec", "-X", "--exec-batch"},
-	"fdfind": {"-x", "--exec", "-X", "--exec-batch"}, // fd as Debian names it
-	"find":   {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"},
-	"sort":   {"-o", "--output"},
-	"uniq":   nil, "cut": nil, "tr": nil, "diff": nil, "cmp": nil, "jq": nil, "column": nil,
-	"echo": nil, "printf": nil, "sleep": nil, "true": nil, "false": nil, "test": nil, "[": nil,
+	"rg":  {"--pre", "--pre-glob"},
+	"cut": nil, "tr": nil, "diff": nil, "cmp": nil, "column": nil,
+	"echo": nil, "printf": nil, "sleep": nil, "true": nil, "false": nil, "test": nil,
 	"pwd": nil, "cd": nil, "date": nil, "which": nil, "whoami": nil, "uname": nil, "id": nil,
 	"basename": nil, "dirname": nil, "realpath": nil, "readlink": nil,
 	"pgrep": nil, "ps": nil, "nproc": nil, "free": nil, "uptime": nil,
-	"git": nil, // only the subcommands in gitReaders
-	"sed": nil, // only printing lines: see sedPrints
+	"sed": nil, // only printing lines: see sedPrint
 }
 
 // sedPrint is a sed script that only prints lines by number, as `sed -n '560,640p;700p'`.
 var sedPrint = regexp.MustCompile(`^(\d+|\$)(,(\d+|\$))?p(;(\d+|\$)(,(\d+|\$))?p)*;?$`)
 
-var gitReaders = map[string]bool{
-	"status": true, "log": true, "diff": true, "show": true, "rev-parse": true, "ls-files": true,
-	"blame": true, "describe": true, "shortlog": true, "rev-list": true, "cat-file": true,
+// secrets are what a word naming credentials holds somewhere in it.
+var secrets = []string{
+	".ssh", ".gnupg", ".aws", ".kube", ".docker", ".netrc", ".git-credentials", ".env",
+	"credentials", "keyring", "id_rsa", "id_ed25519", "id_ecdsa", "auth.json", "service.json",
+	"claude-devin-acp", "/environ",
+}
+
+// word is one word of a command as the shell leaves it, and whether the shell expands it into file
+// names (a glob or a brace): names that can be anything, flags included.
+type word struct {
+	text    string
+	expands bool
 }
 
 // readOnly is whether a tool call is a shell command that only reads.
@@ -46,185 +61,176 @@ func readOnly(call map[string]any) bool {
 	}
 	input, _ := call["rawInput"].(map[string]any)
 	command, _ := input["command"].(string)
-	if strings.TrimSpace(command) == "" {
+	file, err := syntax.NewParser(syntax.Variant(syntax.LangBash)).Parse(strings.NewReader(command), "")
+	if err != nil || len(file.Stmts) == 0 {
 		return false
 	}
-	parts, ok := shellParts(command)
-	if !ok {
-		return false
-	}
-	for _, words := range parts {
-		if !readerCall(words) {
+	for _, stmt := range file.Stmts {
+		if !readerStmt(stmt) {
 			return false
 		}
 	}
 	return true
 }
 
-// readerCall is whether one simple command, as words, only reads.
-func readerCall(words []string) bool {
-	for len(words) > 0 && isAssignment(words[0]) {
-		words = words[1:]
-	}
-	if len(words) == 0 {
-		return true
-	}
-	name := filepath.Base(words[0])
-	refused, known := readers[name]
-	if !known {
+// readerStmt is whether a statement is simple commands that only read, joined by && || or pipes.
+func readerStmt(stmt *syntax.Stmt) bool {
+	if stmt.Coprocess || stmt.Disown {
 		return false
 	}
-	for _, word := range words[1:] {
-		for _, flag := range refused {
-			if word == flag || strings.HasPrefix(word, flag+"=") {
+	for _, redirect := range stmt.Redirs {
+		if !harmless(redirect) {
+			return false
+		}
+	}
+	switch cmd := stmt.Cmd.(type) {
+	case *syntax.BinaryCmd:
+		return readerStmt(cmd.X) && readerStmt(cmd.Y)
+	case *syntax.CallExpr:
+		if len(cmd.Assigns) > 0 || len(cmd.Args) == 0 {
+			return false
+		}
+		words := make([]word, len(cmd.Args))
+		for i, arg := range cmd.Args {
+			w, ok := literal(arg)
+			if !ok {
 				return false
+			}
+			words[i] = w
+		}
+		return readerCall(words)
+	}
+	return false // a function, a group, a subshell, a loop, [[ ]]...
+}
+
+// harmless is whether a redirect only discards output or points it at another descriptor.
+func harmless(r *syntax.Redirect) bool {
+	if r.N != nil && strings.Trim(r.N.Value, "0123456789") != "" {
+		return false // {varname}>
+	}
+	target, ok := literal(r.Word)
+	if !ok || target.expands {
+		return false
+	}
+	switch r.Op {
+	case syntax.RdrOut, syntax.AppOut, syntax.RdrClob, syntax.RdrAll, syntax.AppAll:
+		return target.text == "/dev/null"
+	case syntax.DplOut:
+		return target.text == "-" || strings.Trim(target.text, "0123456789") == "" // >&2, >&-; not >&file
+	}
+	return false // input, here-documents
+}
+
+// literal is a word as the shell leaves it, if it is nothing but literal text and quotes: no
+// expansion of any kind, which could make it anything.
+func literal(w *syntax.Word) (word, bool) {
+	if w == nil {
+		return word{}, false
+	}
+	var b strings.Builder
+	expands := false
+	for _, part := range w.Parts {
+		switch p := part.(type) {
+		case *syntax.Lit:
+			if pattern.HasMeta(p.Value, 0) || strings.Contains(p.Value, "{") {
+				expands = true
+			}
+			b.WriteString(unescape(p.Value))
+		case *syntax.SglQuoted:
+			if p.Dollar {
+				return word{}, false // $'...', whose escapes could spell anything
+			}
+			b.WriteString(p.Value)
+		case *syntax.DblQuoted:
+			if p.Dollar {
+				return word{}, false
+			}
+			for _, inner := range p.Parts {
+				lit, ok := inner.(*syntax.Lit)
+				if !ok {
+					return word{}, false
+				}
+				b.WriteString(dqUnescape.Replace(lit.Value))
+			}
+		default:
+			return word{}, false
+		}
+	}
+	return word{b.String(), expands}, true
+}
+
+// unescape is unquoted text as the shell leaves it: a backslash quotes the character after it.
+func unescape(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			if s[i] == '\n' {
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// dqUnescape is the escapes a double-quoted string takes.
+var dqUnescape = strings.NewReplacer(`\\`, `\`, `\"`, `"`, `\$`, `$`, "\\`", "`", "\\\n", "")
+
+// readerCall is whether one simple command, as words, only reads.
+func readerCall(words []word) bool {
+	name := words[0].text
+	refused, known := readers[name]
+	if !known || words[0].expands {
+		return false
+	}
+	for _, w := range words[1:] {
+		if namesSecret(w.text) {
+			return false
+		}
+		if w.expands && (len(refused) > 0 || name == "sed" || outsideHere(w.text)) {
+			// A file name could be any flag, and a pattern from elsewhere could match anything.
+			return false
+		}
+		for _, flag := range refused {
+			if w.text == flag || strings.HasPrefix(w.text, flag+"=") || strings.HasPrefix(flag, "--") && strings.HasPrefix(w.text, flag) {
+				return false
+			}
+			if short := strings.TrimPrefix(flag, "-"); len(short) == 1 && strings.HasPrefix(w.text, "-") && !strings.HasPrefix(w.text, "--") && strings.Contains(w.text, short) {
+				return false // a cluster such as -bC, or -Cfile
 			}
 		}
 	}
 	if name == "sed" {
 		quiet, script := false, ""
-		for _, arg := range words[1:] {
+		for _, w := range words[1:] {
 			switch {
-			case arg == "-n" || arg == "--quiet" || arg == "--silent":
+			case w.text == "-n" || w.text == "--quiet" || w.text == "--silent":
 				quiet = true
-			case strings.HasPrefix(arg, "-"):
+			case strings.HasPrefix(w.text, "-"):
 				return false // -i, -e, -f and the rest
 			case script == "":
-				script = arg
+				script = w.text
 			}
 		}
 		return quiet && sedPrint.MatchString(script)
 	}
-	if name == "git" {
-		args := words[1:]
-		for len(args) >= 2 && args[0] == "-C" {
-			args = args[2:]
-		}
-		if len(args) == 0 || !gitReaders[args[0]] {
-			return false
-		}
-		for _, arg := range args {
-			if arg == "--output" || strings.HasPrefix(arg, "--output=") || strings.HasPrefix(arg, "--ext-diff") {
-				return false
-			}
-		}
-	}
 	return true
 }
 
-func isAssignment(word string) bool {
-	name, _, found := strings.Cut(word, "=")
-	if !found || name == "" {
-		return false
-	}
-	for _, c := range name {
-		if !(c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9') {
-			return false
+// namesSecret is whether a word names a credential, by any of the paths that hold one.
+func namesSecret(text string) bool {
+	lower := strings.ToLower(text)
+	for _, secret := range secrets {
+		if strings.Contains(lower, secret) {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
-// shellParts splits a command into its simple commands' words, honouring quotes. It refuses (ok
-// false) what it cannot see through or what writes: command substitution, process substitution,
-// backticks, and a redirect to anywhere but /dev/null or another descriptor.
-func shellParts(command string) (parts [][]string, ok bool) {
-	var words []string
-	var word strings.Builder
-	inWord := false
-	endWord := func() {
-		if inWord {
-			words = append(words, word.String())
-			word.Reset()
-			inWord = false
-		}
-	}
-	endPart := func() {
-		endWord()
-		if len(words) > 0 {
-			parts = append(parts, words)
-			words = nil
-		}
-	}
-	runes := []rune(command)
-	for i := 0; i < len(runes); i++ {
-		c := runes[i]
-		switch {
-		case c == '\'':
-			j := i + 1
-			for j < len(runes) && runes[j] != '\'' {
-				j++
-			}
-			if j == len(runes) {
-				return nil, false
-			}
-			word.WriteString(string(runes[i+1 : j]))
-			inWord, i = true, j
-		case c == '"':
-			j := i + 1
-			for j < len(runes) && runes[j] != '"' {
-				if runes[j] == '\\' {
-					j++
-				} else if runes[j] == '`' || runes[j] == '$' && j+1 < len(runes) && runes[j+1] == '(' {
-					return nil, false
-				}
-				j++
-			}
-			if j >= len(runes) {
-				return nil, false
-			}
-			word.WriteString(string(runes[i+1 : j]))
-			inWord, i = true, j
-		case c == '\\' && i+1 < len(runes):
-			word.WriteRune(runes[i+1])
-			inWord = true
-			i++
-		case c == '`', c == '$' && i+1 < len(runes) && runes[i+1] == '(':
-			return nil, false
-		case (c == '<' || c == '>') && i+1 < len(runes) && runes[i+1] == '(':
-			return nil, false
-		case c == '>':
-			// A descriptor before it (2>) is part of the redirect, not a word.
-			if inWord && strings.Trim(word.String(), "0123456789&") == "" {
-				word.Reset()
-				inWord = false
-			}
-			endWord()
-			j := i + 1
-			for j < len(runes) && (runes[j] == '>' || runes[j] == '|') {
-				j++
-			}
-			for j < len(runes) && runes[j] == ' ' {
-				j++
-			}
-			k := j
-			for k < len(runes) && !strings.ContainsRune(" \t\n;&|<>", runes[k]) {
-				k++
-			}
-			target := string(runes[j:k])
-			if j < len(runes) && runes[j] == '&' {
-				k = j + 1
-				for k < len(runes) && runes[k] >= '0' && runes[k] <= '9' {
-					k++
-				}
-				target = "&"
-			}
-			if target != "/dev/null" && target != "&" {
-				return nil, false
-			}
-			i = k - 1
-		case c == '&' && i+1 < len(runes) && runes[i+1] == '>':
-			// &> /dev/null: the > case reads the target.
-			endWord()
-		case c == ';' || c == '&' || c == '|' || c == '\n':
-			endPart()
-		case c == ' ' || c == '\t':
-			endWord()
-		default:
-			word.WriteRune(c)
-			inWord = true
-		}
-	}
-	endPart()
-	return parts, true
+// outsideHere is whether a pattern reaches outside the working directory or into hidden files.
+func outsideHere(pattern string) bool {
+	return strings.HasPrefix(pattern, "~") || strings.HasPrefix(pattern, "/") ||
+		strings.HasPrefix(pattern, ".") || strings.Contains(pattern, "/.")
 }

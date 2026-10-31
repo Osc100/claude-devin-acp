@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,17 +10,19 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// The permission reviewer. With no editor to ask (`serve`), a permission one Devin session asks
+// The permission reviewer. With nobody at a screen to ask, a permission one Devin session asks
 // for is decided by another: a Devin session on SWE-2 at medium, for speed, that does nothing but
 // review. It is handed each request with the asking session's task, and answers through
-// decide_permission, the one tool of the server's MCP server at /mcp/permissions. Its own requests
-// are refused unasked. It is open while any other session is in a turn, and closed once none is.
+// decide_permission, the one tool of the server's MCP server at /mcp/permissions/<secret>: the
+// secret is made each time its session opens and given to that session alone, so nothing else can
+// answer for it. Its own requests are refused unasked. It is open while any other session is in a turn, and closed once none is.
 //
 // Its decisions are kept (permissions.json, beside the conversations): the exact same tool call in
 // the same directory is decided again without asking.
@@ -45,10 +48,13 @@ type reviewer struct {
 
 	state   sync.Mutex
 	session string // its Devin session id, for telling its own requests apart without mu
+	secret  string // the path its session reaches its MCP server at, empty while closed
 	live    int    // other sessions in a turn
 	nextID  int
 	waiting map[string]chan verdict
 	decided map[string]decision // a tool call's key → what was decided of it
+
+	mcp http.Handler // its MCP server, which its session reaches
 }
 
 type verdict struct {
@@ -70,6 +76,7 @@ type decision struct {
 func newReviewer(d *devin, url, dir, store string) *reviewer {
 	v := &reviewer{d: d, url: url, dir: dir, store: store,
 		waiting: map[string]chan verdict{}, decided: map[string]decision{}}
+	v.mcp = mcpHandler(v.tools())
 	if raw, err := os.ReadFile(store); err == nil {
 		if err := json.Unmarshal(raw, &v.decided); err != nil {
 			log.Printf("reading %s: %v", store, err)
@@ -94,12 +101,8 @@ func (v *reviewer) remember(key string, d decision) {
 	v.decided[key] = d
 	raw, _ := json.MarshalIndent(v.decided, "", "  ")
 	v.state.Unlock()
-	if err := os.MkdirAll(filepath.Dir(v.store), 0o755); err != nil {
-		log.Printf("keeping a permission decision: %v", err)
-		return
-	}
 	tmp := v.store + ".tmp"
-	err := os.WriteFile(tmp, raw, 0o644)
+	err := os.WriteFile(tmp, raw, 0o600)
 	if err == nil {
 		err = os.Rename(tmp, v.store)
 	}
@@ -166,13 +169,14 @@ func (v *reviewer) open() error {
 	if err := v.d.start(); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(v.dir, 0o755); err != nil {
+	if err := os.MkdirAll(v.dir, 0o700); err != nil {
 		return err
 	}
+	secret := randomToken(32)
 	result, err := v.d.request("session/new", map[string]any{
 		"cwd": v.dir,
 		"mcpServers": []any{map[string]any{
-			"type": "http", "name": "permissions", "url": v.url, "headers": []any{},
+			"type": "http", "name": "permissions", "url": v.url + "/" + secret, "headers": []any{},
 		}},
 	})
 	if err != nil {
@@ -182,13 +186,12 @@ func (v *reviewer) open() error {
 	if id == "" {
 		return errors.New("Devin opened no session")
 	}
-	r := &run{child: "reviewer:" + id, devinSession: id, cwd: v.dir, loaded: true,
-		agents: map[string]string{rootAgent: "reviewer:" + id}}
+	r := &run{devinSession: id, cwd: v.dir, loaded: true}
 	v.d.mu.Lock()
 	v.d.runs[id] = r
 	v.d.mu.Unlock()
 	v.state.Lock()
-	v.session = id
+	v.session, v.secret = id, secret
 	v.state.Unlock()
 	v.r, v.briefed = r, false
 	if err := v.d.configure(r, "medium"); err != nil {
@@ -212,7 +215,7 @@ func (v *reviewer) close() {
 	delete(v.d.runs, id)
 	v.d.mu.Unlock()
 	v.state.Lock()
-	v.session = ""
+	v.session, v.secret = "", ""
 	v.state.Unlock()
 	v.r = nil
 	if !loaded {
@@ -356,48 +359,43 @@ func describeRequest(id string, asker *run, call map[string]any) string {
 		id, session, cwd, task, described, id)
 }
 
-const reviewerTools = `[{
-  "name": "decide_permission",
-  "title": "Decide a permission request",
-  "description": "Allow or deny one permission request, by its id. Call it exactly once per request.",
-  "inputSchema": {
-    "type": "object",
-    "properties": {
-      "id": {"type": "string", "description": "The request's id, as its message gives it."},
-      "allow": {"type": "boolean", "description": "true to allow the tool call, false to deny it."},
-      "reason": {"type": "string", "description": "One line: why, and for a denial what the agent should do instead."}
-    },
-    "required": ["id", "allow", "reason"]
-  }
-}]`
-
-func (v *reviewer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	serveMCP(w, r, reviewerTools, v.call)
+// tools is the reviewer's MCP server: decide_permission alone.
+func (v *reviewer) tools() *mcp.Server {
+	server := newMCP("permissions")
+	type decideArgs struct {
+		ID     string `json:"id" jsonschema:"The request's id, as its message gives it."`
+		Allow  bool   `json:"allow" jsonschema:"true to allow the tool call, false to deny it."`
+		Reason string `json:"reason" jsonschema:"One line: why, and for a denial what the agent should do instead."`
+	}
+	mcp.AddTool(server, &mcp.Tool{Name: "decide_permission", Title: "Decide a permission request",
+		Description: "Allow or deny one permission request, by its id. Call it exactly once per request."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a decideArgs) (*mcp.CallToolResult, any, error) {
+			v.state.Lock()
+			answer := v.waiting[a.ID]
+			v.state.Unlock()
+			if answer == nil {
+				return nil, nil, fmt.Errorf("no request %s is waiting", a.ID)
+			}
+			select {
+			case answer <- verdict{allow: a.Allow, reason: strings.TrimSpace(a.Reason)}:
+				return said("decided")
+			default:
+				return nil, nil, fmt.Errorf("request %s is already decided", a.ID)
+			}
+		})
+	return server
 }
 
-func (v *reviewer) call(params map[string]any) map[string]any {
-	if name, _ := params["name"].(string); name != "decide_permission" {
-		return toolResult("no tool "+name, true)
-	}
-	args, _ := params["arguments"].(map[string]any)
-	id, _ := args["id"].(string)
-	allow, ok := args["allow"].(bool)
-	reason, _ := args["reason"].(string)
-	if !ok {
-		return toolResult("allow must be true or false", true)
-	}
+// ServeHTTP serves the reviewer's MCP server to the one session holding its secret.
+func (v *reviewer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.state.Lock()
-	answer := v.waiting[id]
+	secret := v.secret
 	v.state.Unlock()
-	if answer == nil {
-		return toolResult("no request "+id+" is waiting", true)
+	if !sameSecret(r.PathValue("secret"), secret) {
+		http.NotFound(w, r)
+		return
 	}
-	select {
-	case answer <- verdict{allow: allow, reason: strings.TrimSpace(reason)}:
-	default:
-		return toolResult("request "+id+" is already decided", true)
-	}
-	return toolResult("decided", false)
+	v.mcp.ServeHTTP(w, r)
 }
 
 // ownTool is whether a tool call is the reviewer's use of its own MCP server, the one thing it

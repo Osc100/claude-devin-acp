@@ -19,9 +19,9 @@ import (
 	"time"
 )
 
-// Devin as a model (`--serve`): an OpenAI-compatible chat endpoint whose replies are Devin's, for
-// a client that takes models but speaks no ACP to agents — OpenCode, which drives no ACP agent
-// (its ACP client mode was closed as not planned) but takes any OpenAI-compatible provider. An
+// Devin as a model: an OpenAI-compatible chat endpoint whose replies are Devin's, for OpenCode,
+// which drives no ACP agent (its ACP client mode was closed as not planned) but takes any
+// OpenAI-compatible provider. An
 // OpenCode subagent whose model is this one is a Devin session, shown in OpenCode's own subagent
 // interface, which Claude starts there through OpenCode's subagent tool.
 //
@@ -150,8 +150,7 @@ func (s *server) load() {
 		return
 	}
 	for key, k := range stored {
-		r := &run{child: "devin:" + k.Session, devinSession: k.Session, cwd: k.Cwd,
-			agents: map[string]string{rootAgent: "devin:" + k.Session}}
+		r := &run{devinSession: k.Session, cwd: k.Cwd}
 		s.d.runs[k.Session] = r
 		s.sessions[key] = &served{r: r, users: k.Users, session: key, title: k.Title, act: &activity{}}
 	}
@@ -166,12 +165,8 @@ func (s *server) save() {
 		stored[key] = kept{Session: conversation.r.devinSession, Cwd: conversation.r.cwd, Users: conversation.users, Title: conversation.title}
 	}
 	raw, _ := json.Marshal(stored)
-	if err := os.MkdirAll(filepath.Dir(s.store), 0o755); err != nil {
-		log.Printf("keeping conversations: %v", err)
-		return
-	}
 	tmp := s.store + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		log.Printf("keeping conversations: %v", err)
 		return
 	}
@@ -182,27 +177,37 @@ func (s *server) save() {
 
 func runServe(listen string, devinArgs []string, idleAfter time.Duration, effort string, maxTasks int) {
 	cwd, _ := os.Getwd()
-	cache, _ := os.UserCacheDir()
-	p := &proxy{children: map[string]*run{}, waiting: map[string]chan map[string]any{}}
-	s := &server{d: newDevin(devinArgs, p), cwd: cwd, sessions: map[string]*served{},
-		store: filepath.Join(cache, "claude-devin-acp", "conversations.json"), maxTasks: maxTasks}
+	token, err := loadToken()
+	if err != nil {
+		log.Fatalf("the token: %v", err)
+	}
+	cache, err := cacheDir()
+	if err != nil {
+		log.Fatalf("the cache: %v", err)
+	}
+	s := &server{d: newDevin(devinArgs), cwd: cwd, sessions: map[string]*served{},
+		store: filepath.Join(cache, "conversations.json"), maxTasks: maxTasks}
 	s.d.idleAfter = idleAfter
 	s.d.effort = effort
-	p.devin = s.d
 	s.rev = newReviewer(s.d, "http://"+loopback(listen)+"/mcp/permissions",
-		filepath.Join(cache, "claude-devin-acp", "reviewer"), filepath.Join(cache, "claude-devin-acp", "permissions.json"))
+		filepath.Join(cache, "reviewer"), filepath.Join(cache, "permissions.json"))
 	s.d.reviewer = s.rev
 	s.load()
 	s.d.loadLimit()
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/models", s.models)
-	mux.HandleFunc("POST /v1/chat/completions", s.complete)
-	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) { serveMCP(w, r, serveTools, s.call) })
-	mux.HandleFunc("/mcp/subagents", serveSubagents)
-	mux.Handle("/mcp/permissions", s.rev)
-	mux.HandleFunc("GET /limit", s.limit)
-	mux.HandleFunc("GET /status", s.status)
-	mux.HandleFunc("GET /status/{session}", s.statusOf)
+	locked := func(pattern string, h http.Handler) { mux.Handle(pattern, guard(token, false, h)) }
+	open := func(pattern string, h http.Handler) { mux.Handle(pattern, guard(token, true, h)) }
+	locked("GET /v1/models", http.HandlerFunc(s.models))
+	locked("POST /v1/chat/completions", http.HandlerFunc(s.complete))
+	locked("/mcp", mcpHandler(s.devinTools()))
+	locked("/mcp/subagents", mcpHandler(subagentTools()))
+	locked("GET /status", http.HandlerFunc(s.status))
+	locked("GET /status/{session}", http.HandlerFunc(s.statusOf))
+	// The reviewer's own server is reached with a secret of its own in the path (reviewer.go).
+	open("/mcp/permissions/{secret}", s.rev)
+	// What wait-limit needs, from inside an agent's sandbox: see guard.go.
+	open("GET /limit", http.HandlerFunc(s.limit))
+	open("POST /compact/{session}", http.HandlerFunc(compact))
 	log.Printf("serving Devin as a model on http://%s/v1", listen)
 	log.Fatal(http.ListenAndServe(listen, mux))
 }
@@ -471,8 +476,7 @@ func (s *server) turn(key, cwd string, users []string) (*served, string, error) 
 		if devinSession == "" {
 			return nil, "", errors.New("Devin opened no session")
 		}
-		r := &run{child: "devin:" + devinSession, devinSession: devinSession, cwd: cwd, loaded: true,
-			agents: map[string]string{rootAgent: "devin:" + devinSession}}
+		r := &run{devinSession: devinSession, cwd: cwd, loaded: true}
 		s.d.mu.Lock()
 		s.d.runs[devinSession] = r
 		s.d.mu.Unlock()

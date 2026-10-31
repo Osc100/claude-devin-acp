@@ -3,7 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -31,7 +35,7 @@ func runWaitLimit(args []string) {
 		return
 	}
 	if *compact {
-		if err := compactSession(os.Getenv("OPENCODE_SESSION_ID")); err != nil {
+		if err := compactSession(*addr, os.Getenv("OPENCODE_SESSION_ID")); err != nil {
 			fmt.Println("Not compacted:", err)
 		} else {
 			fmt.Println("Asked OpenCode to compact this session.")
@@ -42,4 +46,26 @@ func runWaitLimit(args []string) {
 		state.Until.Local().Format("Jan 2 15:04"), until.Local().Format("Jan 2 15:04"), time.Until(until).Round(time.Minute))
 	time.Sleep(time.Until(until))
 	fmt.Println("Devin's rate limit has lifted. Go on with the work, starting again the Devin tasks the limit stopped.")
+}
+
+// compactSession has the server ask OpenCode to compact a session.
+func compactSession(addr, session string) error {
+	if session == "" {
+		return fmt.Errorf("OPENCODE_SESSION_ID is not set: not run by OpenCode")
+	}
+	request, err := http.NewRequest(http.MethodPost, "http://"+addr+"/compact/"+url.PathEscape(session), strings.NewReader("{}"))
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("is the server running? %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		message, _ := io.ReadAll(io.LimitReader(response.Body, 512))
+		return fmt.Errorf("%s: %s", response.Status, strings.TrimSpace(string(message)))
+	}
+	return nil
 }

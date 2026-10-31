@@ -64,8 +64,16 @@ func runStatus(args []string) {
 	}
 }
 
+// get reads an answer of the server's, with the token when this user can read it.
 func get(address string, into any) error {
-	response, err := http.Get(address)
+	request, err := http.NewRequest(http.MethodGet, address, nil)
+	if err != nil {
+		return err
+	}
+	if token := clientToken(); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response, err := http.DefaultClient.Do(request)
 	if err != nil {
 		return fmt.Errorf("is serve running? %w", err)
 	}

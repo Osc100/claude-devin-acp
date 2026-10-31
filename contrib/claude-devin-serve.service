@@ -1,12 +1,15 @@
 [Unit]
-Description=Devin as an OpenAI-compatible model for OpenCode (claude-devin-acp --serve)
+Description=Devin as an OpenAI-compatible model and subagent steering for OpenCode (claude-devin-acp)
 After=network.target
 
 [Service]
-ExecStart=/home/osc/Projects/claude-devin-acp/claude-devin-acp --serve 127.0.0.1:47821
+ExecStart=%h/.local/bin/claude-devin-acp
 WorkingDirectory=%h
-# devin is Homebrew's; a user service does not get the login shell's PATH.
-Environment=PATH=/home/linuxbrew/.linuxbrew/bin:/usr/local/bin:/usr/bin:/bin
+# A user service does not get the login shell's PATH: devin must be on this one, or named by
+# CLAUDE_DEVIN_DEVIN.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# It runs as the user; nothing it or Devin starts gains privileges (no sudo).
+NoNewPrivileges=yes
 Restart=on-failure
 RestartSec=5
 
