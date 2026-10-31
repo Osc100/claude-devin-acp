@@ -1,163 +1,59 @@
 # claude-devin-acp
 
-Claude, with the local Devin CLI as its subagent, as one ACP agent for an editor such as Zed. With
-`--devin-only`, Devin on its own, with its subagents shown as children ("Devin + Devin").
+A small local server that lets [OpenCode](https://opencode.ai) use the Devin CLI as a subagent.
 
-The editor starts this proxy in place of the Claude adapter. Every message between the editor
-and Claude passes through unchanged. On top of that, every session Claude opens gets MCP tools for
-Devin (`mcp__devin__…` to Claude): `start_task` starts a run of `devin acp` in the background and
-returns at once, `wait_for_tasks` collects runs' answers (or only checks on them), `cancel_task`
-stops one. Claude's own subagent
-tools are taken away and its system prompt says to delegate to Devin (`--claude-subagents` leaves
-them). The editor sees each
-Devin run as a subagent of Claude's session, with Devin's own subagents nested under it, through
-ACP's [subagents RFD](https://agentclientprotocol.com/rfds/subagents).
+I run Claude inside OpenCode and wanted it to hand longer tasks off to Devin. OpenCode can't drive
+an ACP agent directly, so this sits in between: it talks to `devin acp` and gives OpenCode a model
+it can call, plus a couple of MCP servers for keeping an eye on subagents while they work.
 
+What you get on `127.0.0.1:47821`:
+
+- `/v1`: Devin as an OpenAI-compatible model (`swe-2-medium`, `swe-2-high`, `swe-2-max`)
+- `/mcp`: check on, message or stop running Devin tasks
+- `/mcp/subagents`: the same for OpenCode's own subagents (handy for DeepSeek when Devin is rate limited)
+
+It also handles Devin's rate limits and has a second Devin session review permission requests,
+so nothing sits waiting for a click.
+
+## Setup
+
+You need the [Devin CLI](https://docs.devin.ai/cli). Grab a binary from
+[Releases](https://github.com/Osc100/claude-devin-acp/releases), or build it with Go:
+
+```sh
+go build -o ~/.local/bin/claude-devin-acp .   # or: put the release binary there
+cp contrib/claude-devin-serve.service ~/.config/systemd/user/
+systemctl --user enable --now claude-devin-serve
 ```
-editor ⇄ claude-devin-acp ⇄ Claude adapter (claude-agent-acp)
-               ⇅  (MCP `devin` tool, on 127.0.0.1)
-           devin acp
-```
 
-## What it relies on
+Then point OpenCode at it in `~/.config/opencode/opencode.jsonc`:
 
-- **Claude adapter**: the one Zed installs from the ACP registry, run as published, signed in
-  through Anthropic's own flow. The proxy never sees a credential. Default:
-  `node ~/.local/share/zed/external_agents/registry/npx/claude-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js`,
-  or `--claude` / `CLAUDE_DEVIN_CLAUDE`.
-- **Devin CLI**: `devin acp` (`--devin` / `CLAUDE_DEVIN_DEVIN`). Devin does not speak the RFD. It
-  reports subagents in a dialect of its own, which only this proxy translates; `devin.go`'s
-  header says what that dialect is, as captured from CLI 3000.11.234.
-- **An editor that shows ACP subagents**: Zed 1.27 preview or later with its `acp-beta` flag.
-  That flag is staff-only in Zed's own builds, so it takes a build with the flag turned on. With
-  any other editor, the tool still works and answers Claude, and nothing is announced.
-
-The proxy answers an editor that asks for ACP v2 with v1. Zed then starts it again over v1, which
-is the RFD form this proxy speaks.
-
-## Zed
-
-`settings.json`:
-
-```json
-"agent_servers": {
-  "Claude + Devin": {
-    "type": "custom",
-    "command": "/home/osc/Projects/claude-devin-acp/claude-devin-acp"
-  },
-  "Devin + Devin": {
-    "type": "custom",
-    "command": "/home/osc/Projects/claude-devin-acp/claude-devin-acp",
-    "args": ["--devin-only"]
+```jsonc
+"provider": {
+  "devin": {
+    "npm": "@ai-sdk/openai-compatible",
+    "options": { "baseURL": "http://127.0.0.1:47821/v1", "apiKey": "{file:~/.local/state/claude-devin-acp/token}", "timeout": false },
+    "models": { "swe-2-high": { "name": "SWE-2 High" } }
+  }
+},
+"agent": {
+  "devin": { "mode": "subagent", "model": "devin/swe-2-high", "description": "Devin, for self-contained coding tasks." }
+},
+"mcp": {
+  "servers": {
+    "devin": { "type": "remote", "url": "http://127.0.0.1:47821/mcp", "headers": { "Authorization": "Bearer {file:~/.local/state/claude-devin-acp/token}" }, "oauth": false, "codemode": false },
+    "subagents": { "type": "remote", "url": "http://127.0.0.1:47821/mcp/subagents", "headers": { "Authorization": "Bearer {file:~/.local/state/claude-devin-acp/token}" }, "oauth": false, "codemode": false }
   }
 }
 ```
 
-In a "Claude + Devin" thread, ask Claude to hand something to Devin. A "Devin + Devin" thread is
-Devin's own, as Zed's registry Devin would be, but its subagents are shown as cards.
+Every request needs the token the server writes to `~/.local/state/claude-devin-acp/token` on
+its first start (only you can read it), and anything that looks like it came from a browser is
+refused, so a web page can't talk to it.
 
-## OpenCode: Devin as a model (`--serve`)
+`claude-devin-acp status` shows what's running, and `claude-devin-acp --help` lists the flags.
+Logs go to the journal, and Devin's own to `~/.cache/claude-devin-acp/devin.log`.
 
-OpenCode drives no ACP agent (its ACP client mode was closed as not planned) but takes any
-OpenAI-compatible provider, so `--serve 127.0.0.1:47821` answers chat completions with a Devin
-session: Devin's text as content, its thoughts as reasoning, its tool calls and any subagent it
-starts as lines. A conversation is known by the session OpenCode names (`x-opencode-session-id`),
-else by its first user message and the working directory OpenCode's prompt states, so a follow-up
-reaches the same Devin session. Devin is told to do the
-task itself. Each turn ends with a line of what it did: files changed, commands, tool calls,
-time, and the model Devin says it ran on.
+## License
 
-A permission Devin asks for is decided by the permission reviewer: another Devin session, on
-SWE-2 at medium, open while any other session is in a turn, which is handed the request and the
-asking session's task and answers through `decide_permission`, the one tool of an MCP server at
-`/mcp/permissions`. Any other request of its own is refused. Its decisions are kept in
-`~/.cache/claude-devin-acp/permissions.json`, and the exact same tool call in the same directory is
-decided again from there; a denied session is told why. A shell command that only reads (each part
-a known reader such as `tail`, `rg`, `ls`, `git log` or `sed -n '1,9p'`, with no redirect but to
-`/dev/null` and no command substitution) is allowed without asking. Only the reviewer's own
-decisions and denials are shown.
-
-Devin is always SWE-2 (`swe-2-high`); how hard it thinks is its `thought_level`, set per session:
-`--devin-effort` (high) by default, the model `swe-2-medium`, `swe-2-high` or `swe-2-max` (Devin's
-own names), or a request's `reasoning_effort`. In Claude + Devin, `start_task` takes an `effort`.
-
-In OpenCode, a `devin` provider and a `devin` subagent on its model (`agent.devin`, `mode:
-subagent`, `model: devin/swe-2-high`); Claude, through OpenCode's Claude Agent provider, starts it
-with OpenCode's own subagent tool, in the background, and OpenCode shows it as its subagent.
-
-At most `--max-tasks` (6) tasks run at once, since Devin's rate limit is shared by all of them;
-the permission reviewer is not counted. One more is not started: its reply says which tasks are
-running and to start it again once one finishes.
-
-Limits: Devin retries a rate limit itself, and once its retries are spent it answers the turn
-with an error saying when the limit lifts; `serve` then says so, waits until then, and has Devin
-go on (up to five times a turn), sessions told the same reset going on 30s apart. A limit lifting more than 20 minutes away (Devin then names the day: "at Oct 31 06:01 UTC") or
-a used-up daily quota is not waited out: the turn ends saying until when, and until then every new
-turn is answered the same at once, without Devin. It is kept in
-`~/.cache/claude-devin-acp/limit.json` across restarts, and `GET /limit` says it.
-`claude-devin-acp wait-limit`, run by an OpenCode agent as a background shell once its Devin
-subagents have finished, has OpenCode compact that session (`OPENCODE_SESSION_ID`), waits until
-the limit lifts and a minute more, and exits, which OpenCode tells the agent so it goes on.
-
-Watching and steering: `/mcp` has `task_status` (the tasks running and finished in the last hour,
-each with the last thing it did), `peek_task` (a task's latest lines), `message_task` and
-`stop_task` (tell it to stop now and report, its turn cancelled after a timeout).
-`claude-devin-acp status [-f] [-n lines] [session]` shows the same from a shell, as over SSH: the
-tasks, or what one has done, followed with `-f`.
-
-OpenCode's own subagents, on any model but Devin (DeepSeek while Devin is rate limited), get the
-same four tools at `/mcp/subagents`, through OpenCode's server API (found in
-`~/.local/state/opencode/service.json`): `message_task` steers one at its next step, or at once
-with `interrupt`, and `stop_task` interrupts one that has not reported in time.
-
-A Devin task whose prompt has a line `Worktree: /abs/path` opens its Devin session in that worktree,
-since OpenCode's subagent tool takes no directory and a subagent otherwise runs where its parent does.
-
-Steering: OpenCode holds a message for a busy subagent until its step ends, and a step here is
-Devin's whole turn. So the server is also an MCP server at `/mcp`, whose `message_task` takes the
-subagent's session id and a message and hands it to Devin at once; Devin takes it as the user
-interrupting, and the subagent's reply goes on with what it does then. In OpenCode:
-`"mcp": {"servers": {"devin": {"type": "remote", "url": "http://127.0.0.1:47821/mcp", "oauth": false, "codemode": false}}}`.
-
-To keep it running: `contrib/claude-devin-serve.service`, as a user service:
-
-```sh
-cp contrib/claude-devin-serve.service ~/.config/systemd/user/
-systemctl --user daemon-reload && systemctl --user enable --now claude-devin-serve
-```
-
-## Devin + Devin
-
-Zed sends the RFD's `subagents` capability, which Devin ignores; Devin reports its subagents only
-when told with flags of Cognition's own, and then in a form Zed does not draw. So the proxy adds
-the flags to the editor's `initialize` (only when the editor shows subagents) and translates what
-comes back. Devin's top agent passes through untouched, being the editor's own thread.
-
-## What is shown
-
-- **The run**: a card under Claude's message. Its thread is Devin's own messages, thoughts and
-  tool calls. Stop cancels Devin's turn.
-- **Devin's subagents**: cards inside the run's thread, each with its own transcript. They have
-  no Stop button: Devin has a way to stop one subagent, but it has not been seen used.
-- **Permissions**: Devin's permission requests are asked in the thread of the agent whose tool
-  call it is.
-- **Answer**: `wait_for_tasks` gives Claude each run's status and, once it is done, its final answer.
-  Passing a finished run's id to `start_task` as `continue` sends a follow-up to the same Devin session.
-  An MCP server cannot wake Claude when a run ends, so Claude collects runs itself; its prompt
-  says to before it ends its turn.
-
-Not done: re-opening an old thread does not bring back the Devin cards (the RFD's replay on
-`session/load`).
-
-## Develop
-
-```sh
-mise install                 # Go, pinned in mise.toml
-go test ./...                # the translation, replayed from a recorded Devin session
-CLAUDE_DEVIN_E2E=1 CLAUDE_DEVIN_E2E_DIR=<scratch repo> go test -run 'EndToEnd' -v ./...
-                             # both modes against the real Devin, Claude faked (spends Devin quota)
-go build -o claude-devin-acp .
-```
-
-Devin's own log goes to `~/.cache/claude-devin-acp/devin.log`; the proxy's goes to its stderr,
-which Zed keeps in its log.
+MIT
