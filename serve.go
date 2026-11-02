@@ -218,6 +218,7 @@ func (s *server) models(w http.ResponseWriter, _ *http.Request) {
 	for _, effort := range []string{"medium", "high", "max"} {
 		models = append(models, map[string]any{"id": "swe-2-" + effort, "object": "model", "owned_by": "cognition"})
 	}
+	models = append(models, map[string]any{"id": terraModel, "object": "model", "owned_by": "openai"})
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
 
@@ -285,9 +286,10 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 		sum := sha256.Sum256([]byte(cwd + "\x00" + users[0]))
 		key = hex.EncodeToString(sum[:])
 	}
-	if l, limited := s.d.limitedUntil(time.Now()); limited {
+	model := modelOf(chat)
+	if l, limited := s.d.limitedUntil(model, time.Now()); limited {
 		// Devin would refuse it at once; said without asking it, and the turn left untaken.
-		log.Printf("turn in %s answered with Devin's rate limit, until %s", cwd, l.until.Local().Format("Jan 2 15:04"))
+		log.Printf("turn in %s answered with %s's rate limit, until %s", cwd, modelName(model), l.until.Local().Format("Jan 2 15:04"))
 		out := newReply(w, chat.Stream)
 		out.line(iconWait + " " + l.Say(time.Now()))
 		out.finish()
@@ -356,7 +358,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 		out.finish()
 		return
 	}
-	if err := s.d.configure(r, effortOf(chat)); err != nil {
+	if err := s.d.configure(r, model, effortOf(chat)); err != nil {
 		out.line("Devin did not start: " + err.Error())
 		out.finish()
 		return
@@ -365,7 +367,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	conversation.live = true
 	s.mu.Unlock()
 	go func() {
-		result, err := s.d.prompt(req.Context(), r.devinSession, prompt, func(l limit) {
+		result, err := s.d.prompt(req.Context(), model, r.devinSession, prompt, func(l limit) {
 			events <- event{rootAgent, map[string]any{"sessionUpdate": rateLimited, "until": l.until}}
 		})
 		if err == nil {
@@ -397,7 +399,7 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 			for len(events) > 0 {
 				out.event(<-events)
 			}
-			if l, limited := limitOf(err, time.Now()); limited && l.long(time.Now()) {
+			if l, limited := limitOf(err, model, time.Now()); limited && l.long(time.Now()) {
 				out.line(iconWait + " " + l.Say(time.Now()))
 			} else if limited {
 				out.line(iconError + " Devin is still rate limited; giving up: " + l.message)
@@ -795,6 +797,14 @@ func (o *reply) finish() {
 		"id": o.id, "object": "chat.completion", "created": time.Now().Unix(), "model": "devin",
 		"choices": []any{map[string]any{"index": 0, "message": message, "finish_reason": "stop"}},
 	})
+}
+
+// modelOf is the Devin model a request asks for: GPT-6.1 Terra by its own id, else SWE-2.
+func modelOf(chat chatRequest) string {
+	if chat.Model == terraModel {
+		return terraModel
+	}
+	return sweModel
 }
 
 // effortOf is the thinking a request asks Devin for: the model's own (`swe-2-max`, Devin's own

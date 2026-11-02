@@ -119,32 +119,55 @@ func TestAPermissionRequestIsTheCallDevinAnnounced(t *testing.T) {
 func TestALimitIsReadOffDevinsError(t *testing.T) {
 	now := time.Date(2026, 10, 30, 6, 42, 10, 0, time.UTC)
 	rate := &acpError{method: "session/prompt", code: -32010, message: "Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 2 minutes (at 06:44 UTC)."}
-	l, ok := limitOf(fmt.Errorf("turn: %w", rate), now)
+	l, ok := limitOf(fmt.Errorf("turn: %w", rate), sweModel, now)
 	if !ok || !l.rate || !l.until.Equal(time.Date(2026, 10, 30, 6, 44, 0, 0, time.UTC)) {
 		t.Errorf("rate limit read as %+v, %v", l, ok)
 	}
 	late := &acpError{message: "Reached free model rate limit. Your limit will reset in 1 minute (at 00:01 UTC)."}
-	if l, _ := limitOf(late, time.Date(2026, 10, 30, 23, 59, 30, 0, time.UTC)); l.until.Day() != 31 {
+	if l, _ := limitOf(late, sweModel, time.Date(2026, 10, 30, 23, 59, 30, 0, time.UTC)); l.until.Day() != 31 {
 		t.Errorf("a reset past midnight is %v", l.until)
 	}
 	long := &acpError{message: "Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different model. Your limit will reset in 6 hours 6 minutes (at Oct 31 06:01 UTC)."}
 	evening := time.Date(2026, 10, 30, 23, 55, 0, 0, time.UTC)
-	if l, ok := limitOf(long, evening); !ok || !l.rate || !l.until.Equal(time.Date(2026, 10, 31, 6, 1, 0, 0, time.UTC)) || !l.long(evening) {
+	if l, ok := limitOf(long, sweModel, evening); !ok || !l.rate || !l.until.Equal(time.Date(2026, 10, 31, 6, 1, 0, 0, time.UTC)) || !l.long(evening) {
 		t.Errorf("a dated limit read as %+v, %v", l, ok)
 	}
-	if l, _ := limitOf(rate, now); l.long(now) {
+	if l, _ := limitOf(rate, sweModel, now); l.long(now) {
 		t.Error("a two-minute limit is too long to wait")
 	}
 	newYear := &acpError{message: "Reached free model rate limit. Your limit will reset in 3 hours (at Jan 1 02:00 UTC)."}
-	if l, _ := limitOf(newYear, time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC)); l.until.Year() != 2027 {
+	if l, _ := limitOf(newYear, sweModel, time.Date(2026, 12, 31, 23, 0, 0, 0, time.UTC)); l.until.Year() != 2027 {
 		t.Errorf("a reset in the new year is %v", l.until)
 	}
 	quota := &acpError{message: "Quota exhausted: Your daily usage quota has been exhausted. Visit https://app.devin.ai/settings/usage to purchase on-demand usage or turn on auto-reload."}
-	if l, ok := limitOf(quota, now); !ok || l.rate {
+	if l, ok := limitOf(quota, sweModel, now); !ok || l.rate {
 		t.Errorf("quota read as %+v, %v", l, ok)
 	}
-	if _, ok := limitOf(&acpError{message: "no such session"}, now); ok {
+	for _, paid := range []string{
+		"You've reached your monthly usage limit. Wait for the limit to reset next month.",
+		"Your organization has reached its monthly usage limit. Ask an account admin to raise it, or wait for the limit to reset next month.",
+		"You've reached your ChatGPT subscription usage limit. Resume this session once your limit resets, or turn off ChatGPT token sharing in settings to continue on Devin usage.",
+		"An admin paused usage on your account. Ask them to resume it to continue.",
+	} {
+		if l, ok := limitOf(&acpError{message: paid}, terraModel, now); !ok || l.rate || l.model != terraModel {
+			t.Errorf("a paid limit read as %+v, %v", l, ok)
+		}
+	}
+	if _, ok := limitOf(&acpError{message: "no such session"}, sweModel, now); ok {
 		t.Error("an unrelated error is a limit")
+	}
+}
+
+// A long limit holds turns on the model that met it, and not on the other.
+func TestALimitHoldsItsModelAlone(t *testing.T) {
+	now := time.Now()
+	d := newDevin(nil)
+	d.longLimits[sweModel] = limit{model: sweModel, rate: true, until: now.Add(time.Hour), message: "Reached free model rate limit."}
+	if _, limited := d.limitedUntil(sweModel, now); !limited {
+		t.Error("SWE-2 is not held by its own limit")
+	}
+	if _, limited := d.limitedUntil(terraModel, now); limited {
+		t.Error("GPT-6.1 Terra is held by SWE-2's free limit")
 	}
 }
 

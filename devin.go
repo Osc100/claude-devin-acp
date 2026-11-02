@@ -61,9 +61,10 @@ type devin struct {
 	proc   *os.Process
 	turns  int // turns running now
 	idle   *time.Timer
-	// longLimit is the last rate limit too long to wait out, which new turns are answered with
+	// longLimits are the last rate limit too long to wait out on each model (SWE-2's is the free
+	// models' limit, GPT-6.1 Terra's a paid one), which new turns on that model are answered with
 	// until it lifts.
-	longLimit limit
+	longLimits map[string]limit
 	// lastResume is when the last session waiting out a rate limit is to go on (`resumeSlot`).
 	lastResume time.Time
 	// reviewer, when set, decides the permissions Devin asks for.
@@ -104,25 +105,48 @@ func (d *devin) rested() {
 // and how hard it thinks is its `thought_level` (SWE-2 "Max" is this model at `max`).
 const sweModel = "swe-2-high"
 
+// terraModel is the one other model a turn may ask for, by Devin's own id: GPT-6.1 Terra, always
+// at medium.
+const terraModel = "gpt-6-1-terra-medium"
+
+// modelName is a Devin model's name as it is said.
+func modelName(model string) string {
+	if model == terraModel {
+		return "GPT-6.1 Terra"
+	}
+	return "SWE-2"
+}
+
 // efforts are the thinking levels Devin takes for SWE-2.
 var efforts = map[string]bool{"medium": true, "high": true, "max": true}
 
-// configure sets r's session to SWE-2 at effort (the default when empty), unless it already is.
-// The model first: setting it puts the thinking back to the model's own default.
-func (d *devin) configure(r *run, effort string) error {
+// configure sets r's session to model (SWE-2 when empty) at effort (the default when empty; GPT-6.1
+// Terra is always at medium), unless it already is. The model first: setting it puts the thinking
+// back to the model's own default.
+func (d *devin) configure(r *run, model, effort string) error {
+	switch model {
+	case "":
+		model = sweModel
+	case sweModel:
+	case terraModel:
+		effort = "medium"
+	default:
+		return fmt.Errorf("no model %q: %s or %s", model, sweModel, terraModel)
+	}
 	if effort == "" {
 		effort = d.effort
 	}
 	if !efforts[effort] {
 		return fmt.Errorf("no effort %q: medium, high or max", effort)
 	}
+	setting := model + " " + effort
 	r.mu.Lock()
-	set := r.effort == effort
+	set := r.setting == setting
 	r.mu.Unlock()
 	if set {
 		return nil
 	}
-	for _, option := range [][2]string{{"model", sweModel}, {"thought_level", effort}} {
+	for _, option := range [][2]string{{"model", model}, {"thought_level", effort}} {
 		if _, err := d.request("session/set_config_option", map[string]any{
 			"sessionId": r.devinSession, "configId": option[0], "value": option[1],
 		}); err != nil {
@@ -130,7 +154,7 @@ func (d *devin) configure(r *run, effort string) error {
 		}
 	}
 	r.mu.Lock()
-	r.effort = effort
+	r.setting = setting
 	r.mu.Unlock()
 	return nil
 }
@@ -166,7 +190,7 @@ func (d *devin) open(r *run) error {
 }
 
 func newDevin(args []string) *devin {
-	return &devin{args: args, pending: map[string]chan map[string]any{}, runs: map[string]*run{}}
+	return &devin{args: args, pending: map[string]chan map[string]any{}, runs: map[string]*run{}, longLimits: map[string]limit{}}
 }
 
 // run is one Devin session: a conversation of OpenCode's (`serve.go`).
@@ -187,9 +211,9 @@ type run struct {
 	// loaded is whether the running Devin process holds its session; replaying, whether it is
 	// replaying it as it loads, when nothing it says is new.
 	loaded, replaying bool
-	// effort is the thinking its session was last set to, empty when it is not known to be set
-	// (a new process, a session loaded again).
-	effort string
+	// setting is the model and thinking its session was last set to, empty when it is not known
+	// to be set (a new process, a session loaded again).
+	setting string
 }
 
 func (d *devin) start() error {
@@ -232,7 +256,7 @@ func (d *devin) start() error {
 		d.ready, d.in, d.proc = nil, nil, nil
 		for _, r := range d.runs {
 			r.mu.Lock()
-			r.loaded, r.effort = false, ""
+			r.loaded, r.setting = false, ""
 			r.mu.Unlock()
 		}
 		for id, answer := range d.pending {
@@ -334,7 +358,7 @@ func (d *devin) fromDevin(line []byte) {
 	case method == "session/request_permission":
 		go d.askPermission(msg)
 	case method == "_cognition.ai/agent_stopped":
-		// Devin's own word on which model a turn ran on (the check that a run is SWE-2 at the
+		// Devin's own word on which model a turn ran on (the check that a run is the model and
 		// effort it was set to), and what the turn did.
 		params, _ := msg["params"].(map[string]any)
 		stats, _ := params["stats"].(map[string]any)

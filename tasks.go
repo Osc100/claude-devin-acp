@@ -280,10 +280,11 @@ func (s *server) steer(conversation *served, message string, said map[string]any
 	return nil
 }
 
-// limit is the rate limit too long to wait out within a turn that Devin is under, if any.
-func (s *server) limit(w http.ResponseWriter, _ *http.Request) {
+// limit is the rate limit too long to wait out within a turn that a Devin model (`?model=`, by
+// any name OpenCode calls it; SWE-2 when none) is under, if any.
+func (s *server) limit(w http.ResponseWriter, req *http.Request) {
 	state := map[string]any{"limited": false}
-	if l, limited := s.d.limitedUntil(time.Now()); limited {
+	if l, limited := s.d.limitedUntil(modelOf(chatRequest{Model: req.URL.Query().Get("model")}), time.Now()); limited {
 		state = map[string]any{"limited": true, "until": l.until, "message": l.message}
 	}
 	w.Header().Set("Content-Type", "application/json")

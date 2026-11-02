@@ -74,6 +74,14 @@ func TestTheModelSaysTheEffort(t *testing.T) {
 	}
 }
 
+func TestTheModelSaysTheModel(t *testing.T) {
+	for model, want := range map[string]string{"gpt-6-1-terra-medium": terraModel, "swe-2-max": sweModel, "devin": sweModel, "gpt-5-6-terra-medium": sweModel} {
+		if got := modelOf(chatRequest{Model: model}); got != want {
+			t.Errorf("%s asked for %q, not %q", model, got, want)
+		}
+	}
+}
+
 // A message reaches only a Devin that is in a turn; otherwise Claude is told where it went wrong.
 // Called as OpenCode calls it, through an MCP client.
 func TestAMessageNeedsATaskInATurn(t *testing.T) {

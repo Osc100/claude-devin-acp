@@ -194,7 +194,7 @@ func (v *reviewer) open() error {
 	v.session, v.secret = id, secret
 	v.state.Unlock()
 	v.r, v.briefed = r, false
-	if err := v.d.configure(r, "medium"); err != nil {
+	if err := v.d.configure(r, sweModel, "medium"); err != nil {
 		v.close()
 		return err
 	}

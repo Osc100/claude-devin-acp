@@ -20,18 +20,20 @@ func runWaitLimit(args []string) {
 	flags := flag.NewFlagSet("wait-limit", flag.ExitOnError)
 	addr := flags.String("addr", envOr("CLAUDE_DEVIN_SERVE", "127.0.0.1:47821"), "the address serve listens on")
 	compact := flags.Bool("compact", true, "have OpenCode compact the session first")
+	model := flags.String("model", sweModel, "the model whose limit to wait out: "+sweModel+" (any swe-2-*) or "+terraModel)
 	_ = flags.Parse(args)
+	name := modelName(modelOf(chatRequest{Model: *model}))
 
 	var state struct {
 		Limited bool      `json:"limited"`
 		Until   time.Time `json:"until"`
 		Message string    `json:"message"`
 	}
-	if err := get("http://"+*addr+"/limit", &state); err != nil {
+	if err := get("http://"+*addr+"/limit?model="+url.QueryEscape(*model), &state); err != nil {
 		fail(err)
 	}
 	if !state.Limited {
-		fmt.Println("Devin is not rate limited now: go on.")
+		fmt.Printf("Devin's %s is not rate limited now: go on.\n", name)
 		return
 	}
 	if *compact {
@@ -42,10 +44,10 @@ func runWaitLimit(args []string) {
 		}
 	}
 	until := state.Until.Add(limitMargin)
-	fmt.Printf("Devin is rate limited until %s; waiting until %s (%s).\n",
+	fmt.Printf("Devin's %s is rate limited until %s; waiting until %s (%s).\n", name,
 		state.Until.Local().Format("Jan 2 15:04"), until.Local().Format("Jan 2 15:04"), time.Until(until).Round(time.Minute))
 	time.Sleep(time.Until(until))
-	fmt.Println("Devin's rate limit has lifted. Go on with the work, starting again the Devin tasks the limit stopped.")
+	fmt.Printf("Devin's %s rate limit has lifted. Go on with the work, starting again the Devin tasks the limit stopped.\n", name)
 }
 
 // compactSession has the server ask OpenCode to compact a session.
