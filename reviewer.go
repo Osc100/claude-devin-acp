@@ -22,7 +22,9 @@ import (
 // review. It is handed each request with the asking session's task, and answers through
 // decide_permission, the one tool of the server's MCP server at /mcp/permissions/<secret>: the
 // secret is made each time its session opens and given to that session alone, so nothing else can
-// answer for it. Its own requests are refused unasked. It is open while any other session is in a turn, and closed once none is.
+// answer for it. Its own requests are refused unasked. While SWE-2 is under a rate limit too long
+// to wait out it cannot review, so every request is denied at once, a turn on GPT-6.1 Terra's
+// among them. It is open while any other session is in a turn, and closed once none is.
 //
 // Its decisions are kept (permissions.json, beside the conversations): the exact same tool call in
 // the same directory is decided again without asking.
@@ -256,6 +258,9 @@ type asked struct {
 }
 
 func (v *reviewer) ask(asker *run, call map[string]any) asked {
+	if l, limited := v.d.limitedUntil(sweModel, time.Now()); limited {
+		return asked{verdict: verdict{reason: limitDenial(l)}}
+	}
 	v.mu.Lock()
 	if err := v.open(); err != nil {
 		v.mu.Unlock()
@@ -311,6 +316,10 @@ func (v *reviewer) ask(asker *run, call map[string]any) asked {
 			return asked{got, true}
 		default:
 		}
+		if l, limited := limitOf(err, sweModel, time.Now()); limited && l.rate && l.long(time.Now()) {
+			v.d.holdLimit(l)
+			return asked{verdict: verdict{reason: limitDenial(l)}}
+		}
 		if err != nil {
 			return asked{verdict: verdict{reason: "the permission reviewer failed: " + err.Error()}}
 		}
@@ -319,6 +328,12 @@ func (v *reviewer) ask(asker *run, call map[string]any) asked {
 		settle()
 		return asked{verdict: verdict{reason: "the permission reviewer did not decide within " + reviewTimeout.String()}}
 	}
+}
+
+// limitDenial is the reason a request is denied while the reviewer's model is under l.
+func limitDenial(l limit) string {
+	return fmt.Sprintf("the permission reviewer runs on %s, which is rate limited until %s, so nothing that needs permission is allowed until then: go on without it, or stop and report what is left",
+		modelName(l.model), l.until.Local().Format("Jan 2 15:04"))
 }
 
 // describeRequest is a request as the reviewer is handed it.

@@ -207,3 +207,18 @@ func TestRateLimitedSessionsGoOnApart(t *testing.T) {
 		t.Errorf("a later limit is held to %v", got)
 	}
 }
+
+// While SWE-2 is under a long limit the reviewer cannot run, so a request is denied at once,
+// without opening it, and the denial is not kept.
+func TestAReviewerUnderALimitDeniesAll(t *testing.T) {
+	d := newDevin(nil)
+	d.longLimits[sweModel] = limit{model: sweModel, rate: true, until: time.Now().Add(time.Hour)}
+	v := newReviewer(d, "", t.TempDir(), filepath.Join(t.TempDir(), "permissions.json"))
+	got := v.review(&run{cwd: t.TempDir()}, map[string]any{"kind": "execute", "title": "go test ./..."})
+	if got.allow || !strings.Contains(got.reason, "rate limited") {
+		t.Errorf("reviewed as %+v", got)
+	}
+	if len(v.decided) != 0 {
+		t.Errorf("the denial was kept: %v", v.decided)
+	}
+}
