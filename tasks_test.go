@@ -149,7 +149,7 @@ func TestALimitIsReadOffDevinsError(t *testing.T) {
 		"You've reached your ChatGPT subscription usage limit. Resume this session once your limit resets, or turn off ChatGPT token sharing in settings to continue on Devin usage.",
 		"An admin paused usage on your account. Ask them to resume it to continue.",
 	} {
-		if l, ok := limitOf(&acpError{message: paid}, terraModel, now); !ok || l.rate || l.model != terraModel {
+		if l, ok := limitOf(&acpError{message: paid}, lunaModel, now); !ok || l.rate || l.model != lunaModel {
 			t.Errorf("a paid limit read as %+v, %v", l, ok)
 		}
 	}
@@ -166,8 +166,8 @@ func TestALimitHoldsItsModelAlone(t *testing.T) {
 	if _, limited := d.limitedUntil(sweModel, now); !limited {
 		t.Error("SWE-2 is not held by its own limit")
 	}
-	if _, limited := d.limitedUntil(terraModel, now); limited {
-		t.Error("GPT-6.1 Terra is held by SWE-2's free limit")
+	if _, limited := d.limitedUntil(lunaModel, now); limited {
+		t.Error("GPT-6 Luna is held by SWE-2's free limit")
 	}
 }
 
@@ -208,12 +208,20 @@ func TestRateLimitedSessionsGoOnApart(t *testing.T) {
 	}
 }
 
-// While SWE-2 is under a long limit the reviewer cannot run, so a request is denied at once,
-// without opening it, and the denial is not kept.
-func TestAReviewerUnderALimitDeniesAll(t *testing.T) {
+// The reviewer is on SWE-2, on GPT-6 Luna while SWE-2 is under a long limit, and with both
+// limited it cannot run: a request is denied at once, without opening it, and the denial is not
+// kept.
+func TestTheReviewerFallsBackToLuna(t *testing.T) {
 	d := newDevin(nil)
-	d.longLimits[sweModel] = limit{model: sweModel, rate: true, until: time.Now().Add(time.Hour)}
 	v := newReviewer(d, "", t.TempDir(), filepath.Join(t.TempDir(), "permissions.json"))
+	if model, _ := v.reviewerModel(); model != sweModel {
+		t.Errorf("unlimited, the reviewer is on %q", model)
+	}
+	d.longLimits[sweModel] = limit{model: sweModel, rate: true, until: time.Now().Add(time.Hour)}
+	if model, l := v.reviewerModel(); model != lunaModel || l == nil || l.model != sweModel {
+		t.Errorf("with SWE-2 limited, the reviewer is on %q (%+v)", model, l)
+	}
+	d.longLimits[lunaModel] = limit{model: lunaModel, rate: true, until: time.Now().Add(time.Hour)}
 	got := v.review(&run{cwd: t.TempDir()}, map[string]any{"kind": "execute", "title": "go test ./..."})
 	if got.allow || !strings.Contains(got.reason, "rate limited") {
 		t.Errorf("reviewed as %+v", got)

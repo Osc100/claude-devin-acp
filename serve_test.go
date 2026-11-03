@@ -67,7 +67,7 @@ func TestTheWorkingDirectoryIsReadOffOpenCodesPrompt(t *testing.T) {
 }
 
 func TestTheModelSaysTheEffort(t *testing.T) {
-	for model, want := range map[string]string{"swe-2-max": "max", "swe-2-medium": "medium", "swe-2-high": "high", "devin": ""} {
+	for model, want := range map[string]string{"swe-2-max": "max", "swe-2-medium": "medium", "swe-2-high": "high", "devin": "", "gpt-6-luna-high": "high"} {
 		if got := effortOf(chatRequest{Model: model}); got != want {
 			t.Errorf("%s asked for %q, not %q", model, got, want)
 		}
@@ -75,7 +75,7 @@ func TestTheModelSaysTheEffort(t *testing.T) {
 }
 
 func TestTheModelSaysTheModel(t *testing.T) {
-	for model, want := range map[string]string{"gpt-6-1-terra-medium": terraModel, "swe-2-max": sweModel, "devin": sweModel, "gpt-5-6-terra-medium": sweModel} {
+	for model, want := range map[string]string{"gpt-6-luna-high": lunaModel, "swe-2-max": sweModel, "devin": sweModel, "gpt-6-1-terra-medium": sweModel, "gpt-6-luna-medium": sweModel} {
 		if got := modelOf(chatRequest{Model: model}); got != want {
 			t.Errorf("%s asked for %q, not %q", model, got, want)
 		}

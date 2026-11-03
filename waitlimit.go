@@ -20,7 +20,7 @@ func runWaitLimit(args []string) {
 	flags := flag.NewFlagSet("wait-limit", flag.ExitOnError)
 	addr := flags.String("addr", envOr("CLAUDE_DEVIN_SERVE", "127.0.0.1:47821"), "the address serve listens on")
 	compact := flags.Bool("compact", true, "have OpenCode compact the session first")
-	model := flags.String("model", sweModel, "the model whose limit to wait out: "+sweModel+" (any swe-2-*) or "+terraModel)
+	model := flags.String("model", sweModel, "the model whose limit to wait out: "+sweModel+" (any swe-2-*) or "+lunaHigh)
 	_ = flags.Parse(args)
 	name := modelName(modelOf(chatRequest{Model: *model}))
 

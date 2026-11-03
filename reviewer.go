@@ -23,8 +23,9 @@ import (
 // decide_permission, the one tool of the server's MCP server at /mcp/permissions/<secret>: the
 // secret is made each time its session opens and given to that session alone, so nothing else can
 // answer for it. Its own requests are refused unasked. While SWE-2 is under a rate limit too long
-// to wait out it cannot review, so every request is denied at once, a turn on GPT-6.1 Terra's
-// among them. It is open while any other session is in a turn, and closed once none is.
+// to wait out, the reviewer is a session on GPT-6 Luna at low instead, closed the moment the limit
+// lifts (its review in progress cancelled, and denied) for SWE-2 again; with Luna limited too,
+// every request is denied at once. It is open while any other session is in a turn, and closed once none is.
 //
 // Its decisions are kept (permissions.json, beside the conversations): the exact same tool call in
 // the same directory is decided again without asking.
@@ -47,9 +48,12 @@ type reviewer struct {
 	mu      sync.Mutex
 	r       *run // its session, nil while closed
 	briefed bool // whether its session has been given reviewerBrief
+	// lift, while its session is on GPT-6 Luna, closes it when SWE-2's limit lifts.
+	lift *time.Timer
 
 	state   sync.Mutex
 	session string // its Devin session id, for telling its own requests apart without mu
+	model   string // the model its session is on, empty while closed
 	secret  string // the path its session reaches its MCP server at, empty while closed
 	live    int    // other sessions in a turn
 	nextID  int
@@ -156,14 +160,36 @@ func (v *reviewer) is(devinSession string) bool {
 	return devinSession != "" && devinSession == v.session
 }
 
-// open has the reviewer's session open in the running Devin: a new one if Devin was restarted
-// since. Called with v.mu held.
+// reviewerModel is the model the reviewer is to be on now: SWE-2, else GPT-6 Luna while SWE-2 is
+// under a long limit, else none, with why.
+func (v *reviewer) reviewerModel() (string, *limit) {
+	now := time.Now()
+	l, limited := v.d.limitedUntil(sweModel, now)
+	if !limited {
+		return sweModel, nil
+	}
+	if luna, limited := v.d.limitedUntil(lunaModel, now); limited {
+		return "", &luna
+	}
+	return lunaModel, &l
+}
+
+// open has the reviewer's session open in the running Devin, on the model it is to be on now: a
+// new one if Devin was restarted since or the model has changed. Called with v.mu held.
 func (v *reviewer) open() error {
+	model, l := v.reviewerModel()
+	if model == "" {
+		v.close()
+		return errors.New(limitDenial(*l))
+	}
 	if v.r != nil {
 		v.r.mu.Lock()
 		loaded := v.r.loaded
 		v.r.mu.Unlock()
-		if loaded {
+		v.state.Lock()
+		same := v.model == model
+		v.state.Unlock()
+		if loaded && same {
 			return nil
 		}
 		v.close()
@@ -193,19 +219,70 @@ func (v *reviewer) open() error {
 	v.d.runs[id] = r
 	v.d.mu.Unlock()
 	v.state.Lock()
-	v.session, v.secret = id, secret
+	v.session, v.secret, v.model = id, secret, model
 	v.state.Unlock()
 	v.r, v.briefed = r, false
-	if err := v.d.configure(r, sweModel, "medium"); err != nil {
+	if err := v.d.configure(r, model, "medium"); err != nil {
 		v.close()
 		return err
 	}
-	log.Printf("permission reviewer open as %s", id)
+	if model == lunaModel {
+		v.closeAt(l.until)
+	}
+	log.Printf("permission reviewer open as %s, on %s", id, modelName(model))
 	return nil
+}
+
+// closeAt closes the reviewer's GPT-6 Luna session once SWE-2's limit lifts at until, at once: a
+// review in progress is cancelled, and denied. A limit since met again moves it later. Called with
+// v.mu held.
+func (v *reviewer) closeAt(until time.Time) {
+	if v.lift != nil {
+		v.lift.Stop()
+	}
+	var lift *time.Timer
+	lift = time.AfterFunc(time.Until(until), func() {
+		if l, limited := v.d.limitedUntil(sweModel, time.Now()); limited {
+			v.mu.Lock()
+			if v.lift == lift {
+				v.closeAt(l.until)
+			}
+			v.mu.Unlock()
+			return
+		}
+		v.state.Lock()
+		session, onLuna := v.session, v.model == lunaModel
+		v.state.Unlock()
+		if !onLuna {
+			return
+		}
+		// Cancelled before taking mu, which a review holds until its turn ends.
+		v.d.notifyDevin("session/cancel", map[string]any{"sessionId": session})
+		v.mu.Lock()
+		defer v.mu.Unlock()
+		if v.lift != lift {
+			return
+		}
+		log.Printf("SWE-2's limit has lifted; closing the GPT-6 Luna permission reviewer")
+		v.close()
+		v.state.Lock()
+		live := v.live > 0
+		v.state.Unlock()
+		if live {
+			if err := v.open(); err != nil {
+				log.Printf("opening the permission reviewer: %v", err)
+			}
+		}
+	})
+	v.lift = lift
 }
 
 // close closes the reviewer's session. Called with v.mu held.
 func (v *reviewer) close() {
+	if v.lift != nil {
+		v.lift.Stop()
+		v.lift = nil
+	}
 	if v.r == nil {
 		return
 	}
@@ -217,7 +294,7 @@ func (v *reviewer) close() {
 	delete(v.d.runs, id)
 	v.d.mu.Unlock()
 	v.state.Lock()
-	v.session, v.secret = "", ""
+	v.session, v.secret, v.model = "", "", ""
 	v.state.Unlock()
 	v.r = nil
 	if !loaded {
@@ -258,14 +335,14 @@ type asked struct {
 }
 
 func (v *reviewer) ask(asker *run, call map[string]any) asked {
-	if l, limited := v.d.limitedUntil(sweModel, time.Now()); limited {
-		return asked{verdict: verdict{reason: limitDenial(l)}}
-	}
 	v.mu.Lock()
 	if err := v.open(); err != nil {
 		v.mu.Unlock()
 		return asked{verdict: verdict{reason: "the permission reviewer did not open: " + err.Error()}}
 	}
+	v.state.Lock()
+	model := v.model
+	v.state.Unlock()
 	v.state.Lock()
 	v.nextID++
 	id := fmt.Sprintf("p%d", v.nextID)
@@ -316,9 +393,10 @@ func (v *reviewer) ask(asker *run, call map[string]any) asked {
 			return asked{got, true}
 		default:
 		}
-		if l, limited := limitOf(err, sweModel, time.Now()); limited && l.rate && l.long(time.Now()) {
+		if l, limited := limitOf(err, model, time.Now()); limited && l.rate && l.long(time.Now()) {
+			// Asked again, of GPT-6 Luna for SWE-2's limit, or denied for Luna's.
 			v.d.holdLimit(l)
-			return asked{verdict: verdict{reason: limitDenial(l)}}
+			return v.ask(asker, call)
 		}
 		if err != nil {
 			return asked{verdict: verdict{reason: "the permission reviewer failed: " + err.Error()}}
@@ -330,10 +408,11 @@ func (v *reviewer) ask(asker *run, call map[string]any) asked {
 	}
 }
 
-// limitDenial is the reason a request is denied while the reviewer's model is under l.
+// limitDenial is the reason a request is denied while both the reviewer's models are limited,
+// GPT-6 Luna under l.
 func limitDenial(l limit) string {
-	return fmt.Sprintf("the permission reviewer runs on %s, which is rate limited until %s, so nothing that needs permission is allowed until then: go on without it, or stop and report what is left",
-		modelName(l.model), l.until.Local().Format("Jan 2 15:04"))
+	return fmt.Sprintf("the permission reviewer's models, SWE-2 and then %s, are both rate limited (%s until %s), so nothing that needs permission is allowed until then: go on without it, or stop and report what is left",
+		modelName(l.model), modelName(l.model), l.until.Local().Format("Jan 2 15:04"))
 }
 
 // describeRequest is a request as the reviewer is handed it.

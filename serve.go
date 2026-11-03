@@ -218,7 +218,7 @@ func (s *server) models(w http.ResponseWriter, _ *http.Request) {
 	for _, effort := range []string{"medium", "high", "max"} {
 		models = append(models, map[string]any{"id": "swe-2-" + effort, "object": "model", "owned_by": "cognition"})
 	}
-	models = append(models, map[string]any{"id": terraModel, "object": "model", "owned_by": "openai"})
+	models = append(models, map[string]any{"id": lunaHigh, "object": "model", "owned_by": "openai"})
 	_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": models})
 }
 
@@ -799,10 +799,10 @@ func (o *reply) finish() {
 	})
 }
 
-// modelOf is the Devin model a request asks for: GPT-6.1 Terra by its own id, else SWE-2.
+// modelOf is the Devin model a request asks for: GPT-6 Luna as lunaHigh, else SWE-2.
 func modelOf(chat chatRequest) string {
-	if chat.Model == terraModel {
-		return terraModel
+	if chat.Model == lunaHigh {
+		return lunaModel
 	}
 	return sweModel
 }
@@ -812,6 +812,9 @@ func modelOf(chat chatRequest) string {
 // request's `reasoning_effort` where it is one Devin takes (low is taken as medium), else none,
 // for the server's default.
 func effortOf(chat chatRequest) string {
+	if chat.Model == lunaHigh {
+		return "high"
+	}
 	if effort, ok := strings.CutPrefix(chat.Model, "swe-2-"); ok && efforts[effort] {
 		return effort
 	}

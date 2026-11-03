@@ -62,7 +62,7 @@ type devin struct {
 	turns  int // turns running now
 	idle   *time.Timer
 	// longLimits are the last rate limit too long to wait out on each model (SWE-2's is the free
-	// models' limit, GPT-6.1 Terra's a paid one), which new turns on that model are answered with
+	// models' limit, GPT-6 Luna's a paid one), which new turns on that model are answered with
 	// until it lifts.
 	longLimits map[string]limit
 	// lastResume is when the last session waiting out a rate limit is to go on (`resumeSlot`).
@@ -105,14 +105,26 @@ func (d *devin) rested() {
 // and how hard it thinks is its `thought_level` (SWE-2 "Max" is this model at `max`).
 const sweModel = "swe-2-high"
 
-// terraModel is the one other model a turn may ask for, by Devin's own id: GPT-6.1 Terra, always
-// at medium.
-const terraModel = "gpt-6-1-terra-medium"
+// lunaModel is GPT-6 Luna, by Devin's own id: the one other model a turn may ask for, always at
+// high (as lunaHigh), and the permission reviewer's while SWE-2 is under a long rate limit, at low
+// for speed.
+const lunaModel = "gpt-6-luna-medium"
+
+// lunaHigh is the name OpenCode asks for GPT-6 Luna at high by.
+const lunaHigh = "gpt-6-luna-high"
+
+// offered is the name OpenCode knows a Devin model by.
+func offered(model string) string {
+	if model == lunaModel {
+		return lunaHigh
+	}
+	return model
+}
 
 // modelName is a Devin model's name as it is said.
 func modelName(model string) string {
-	if model == terraModel {
-		return "GPT-6.1 Terra"
+	if model == lunaModel {
+		return "GPT-6 Luna"
 	}
 	return "SWE-2"
 }
@@ -120,23 +132,25 @@ func modelName(model string) string {
 // efforts are the thinking levels Devin takes for SWE-2.
 var efforts = map[string]bool{"medium": true, "high": true, "max": true}
 
-// configure sets r's session to model (SWE-2 when empty) at effort (the default when empty; GPT-6.1
-// Terra is always at medium), unless it already is. The model first: setting it puts the thinking
-// back to the model's own default.
+// configure sets r's session to model (SWE-2 when empty) at effort (the default when empty; GPT-6
+// Luna is at high or else low), unless it already is. The model first: setting it puts the
+// thinking back to the model's own default.
 func (d *devin) configure(r *run, model, effort string) error {
 	switch model {
 	case "":
 		model = sweModel
 	case sweModel:
-	case terraModel:
-		effort = "medium"
+	case lunaModel:
+		if effort != "high" {
+			effort = "low"
+		}
 	default:
-		return fmt.Errorf("no model %q: %s or %s", model, sweModel, terraModel)
+		return fmt.Errorf("no model %q: %s or %s", model, sweModel, lunaModel)
 	}
 	if effort == "" {
 		effort = d.effort
 	}
-	if !efforts[effort] {
+	if !efforts[effort] && model != lunaModel {
 		return fmt.Errorf("no effort %q: medium, high or max", effort)
 	}
 	setting := model + " " + effort

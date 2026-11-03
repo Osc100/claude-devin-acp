@@ -26,7 +26,7 @@ import (
 // new turn is answered the same at once, without Devin.
 //
 // A limit is the model's that met it: SWE-2 is a free model, and "Reached free model rate limit"
-// is the free models' limit, while GPT-6.1 Terra is paid usage, held by the paid limits below; so
+// is the free models' limit, while GPT-6 Luna is paid usage, held by the paid limits below; so
 // one model's limit leaves turns on the other to run.
 //
 // The paid limits name no time they lift, and are reported, not waited out: the daily quota
@@ -131,13 +131,13 @@ func (l limit) Say(now time.Time) string {
 	if !l.rate {
 		other := sweModel
 		if l.model == sweModel {
-			other = terraModel
+			other = lunaModel
 		}
 		return fmt.Sprintf("Devin's %s is out of usage, with no time it lifts; %s is not held by this. %s",
 			modelName(l.model), modelName(other), l.message)
 	}
 	return fmt.Sprintf("Devin's %s is rate limited until %s (in %s), too long to wait within a turn; start this again then (`claude-devin-acp wait-limit --model %s` waits for it). %s",
-		modelName(l.model), l.until.Local().Format("Jan 2 15:04"), l.until.Sub(now).Round(time.Minute), l.model, l.message)
+		modelName(l.model), l.until.Local().Format("Jan 2 15:04"), l.until.Sub(now).Round(time.Minute), offered(l.model), l.message)
 }
 
 // limitedUntil is a long limit Devin's model is under, if it is under one now: what a new turn on

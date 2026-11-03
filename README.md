@@ -9,7 +9,7 @@ it can call, plus a couple of MCP servers for keeping an eye on subagents while 
 What you get on `127.0.0.1:47821`:
 
 - `/v1`: Devin as an OpenAI-compatible model (`swe-2-medium`, `swe-2-high`, `swe-2-max`,
-  and `gpt-6-1-terra-medium` for GPT-6.1 Terra at medium)
+  and `gpt-6-luna-high` for GPT-6 Luna at high)
 - `/mcp`: check on, message or stop running Devin tasks
 - `/mcp/subagents`: the same for OpenCode's own subagents (handy for DeepSeek when Devin is rate limited)
 
