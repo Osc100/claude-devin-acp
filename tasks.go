@@ -249,7 +249,39 @@ func (s *server) devinTools() *mcp.Server {
 			}()
 			return said("Devin is told to stop and report; its report is its reply to the subagent call. Its turn is cancelled if it has not finished in " + strconv.Itoa(int(timeout)) + "s.")
 		})
+	type forceArgs struct {
+		SessionID string `json:"sessionID" jsonschema:"The subagent's session, as the subagent tool gave it."`
+	}
+	mcp.AddTool(server, &mcp.Tool{Name: "force_stop_task", Title: "Force stop a Devin task",
+		Description: "Cut a running Devin task short at once: its turn is cancelled now, without asking it to wrap up or report, and the subagent call ends within seconds even if Devin does not let go. For a task that is stuck, looping, doing harm, or ignoring stop_task; files may be left half-edited. Prefer stop_task when the work done so far matters."},
+		func(_ context.Context, _ *mcp.CallToolRequest, a forceArgs) (*mcp.CallToolResult, any, error) {
+			conversation, err := s.find(a.SessionID)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := s.forceStop(conversation); err != nil {
+				return nil, nil, err
+			}
+			return said("Devin's turn is cancelled and the subagent call is ending now. Check the files it was working on: it may have left them half-done.")
+		})
 	return server
+}
+
+// forceStop ends a conversation's turn in progress at once.
+func (s *server) forceStop(conversation *served) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !conversation.busy || conversation.forced == nil {
+		return fmt.Errorf("Devin is not working on session %s now; there is nothing to stop", conversation.session)
+	}
+	select {
+	case <-conversation.forced:
+		return fmt.Errorf("session %s is already being force-stopped", conversation.session)
+	default:
+		close(conversation.forced)
+	}
+	log.Printf("force-stopping %s (%s)", conversation.r.devinSession, conversation.session)
+	return nil
 }
 
 // steer hands Devin a message in the middle of a conversation's turn, and the turn's watcher the

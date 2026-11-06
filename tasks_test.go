@@ -230,3 +230,23 @@ func TestTheReviewerFallsBackToLuna(t *testing.T) {
 		t.Errorf("the denial was kept: %v", v.decided)
 	}
 }
+
+func TestAForceStopEndsOnlyARunningTurnOnce(t *testing.T) {
+	s := &server{sessions: map[string]*served{}}
+	c := &served{r: &run{devinSession: "d1"}, session: "ses_1"}
+	if err := s.forceStop(c); err == nil {
+		t.Error("stopped a conversation with no turn running")
+	}
+	c.busy, c.forced = true, make(chan struct{})
+	if err := s.forceStop(c); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-c.forced:
+	default:
+		t.Error("the turn was not told to end")
+	}
+	if err := s.forceStop(c); err == nil {
+		t.Error("force-stopped the same turn twice")
+	}
+}

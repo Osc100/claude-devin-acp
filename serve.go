@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -48,6 +49,9 @@ const soloInstruction = "\n\n(You are running as a subagent of another agent. Do
 // keepalive is how often a turn with nothing new says so, so that no proxy or client between
 // gives a long Devin turn up as a dead connection.
 const keepalive = 15 * time.Second
+
+// forceGrace is how long a force-stopped turn waits for Devin to let it go before ending anyway.
+const forceGrace = 5 * time.Second
 
 var workingDirectory = regexp.MustCompile(`(?m)^\s*Working directory: (.+?)\s*$`)
 
@@ -127,6 +131,8 @@ type served struct {
 	started, ended time.Time
 	act            *activity
 	turnEnded      chan struct{}
+	// forced is closed to end the turn in progress at once, whether or not Devin lets it go.
+	forced chan struct{}
 }
 
 // kept is a conversation as the store keeps it.
@@ -315,15 +321,15 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	out := newReply(w, chat.Stream)
 	out.cwd = cwd
 	start := time.Now()
-	ended := make(chan struct{})
+	ended, forced := make(chan struct{}), make(chan struct{})
 	s.mu.Lock()
 	out.act = conversation.act
-	conversation.started, conversation.turnEnded = start, ended
+	conversation.started, conversation.turnEnded, conversation.forced = start, ended, forced
 	s.mu.Unlock()
 	out.act.write(fmt.Sprintf("\n── turn %d, %s ──\n", conversation.users, start.Format("15:04:05")))
 	defer func() {
 		s.mu.Lock()
-		conversation.busy, conversation.live = false, false
+		conversation.busy, conversation.live, conversation.forced = false, false, nil
 		conversation.ended = time.Now()
 		close(ended)
 		s.mu.Unlock()
@@ -366,8 +372,10 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 	s.mu.Lock()
 	conversation.live = true
 	s.mu.Unlock()
+	ctx, cancel := context.WithCancel(req.Context())
+	defer cancel()
 	go func() {
-		result, err := s.d.prompt(req.Context(), model, r.devinSession, prompt, func(l limit) {
+		result, err := s.d.prompt(ctx, model, r.devinSession, prompt, func(l limit) {
 			events <- event{rootAgent, map[string]any{"sessionUpdate": rateLimited, "until": l.until}}
 		})
 		if err == nil {
@@ -394,6 +402,23 @@ func (s *server) complete(w http.ResponseWriter, req *http.Request) {
 			log.Printf("the client gave up turn %d of %s; cancelling it", conversation.users, r.devinSession)
 			s.d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
 			<-done
+			return
+		case <-forced:
+			log.Printf("turn %d of %s force-stopped; cancelling it", conversation.users, r.devinSession)
+			s.d.notifyDevin("session/cancel", map[string]any{"sessionId": r.devinSession})
+			cancel() // a rate-limit wait ends now too
+			// Devin is given a moment to let the turn go; the turn ends either way.
+			select {
+			case <-done:
+			case <-time.After(forceGrace):
+				log.Printf("%s did not end its turn within %s of being cancelled; ending it anyway", r.devinSession, forceGrace)
+			}
+			for len(events) > 0 {
+				out.event(<-events)
+			}
+			out.line(iconStop + " Force-stopped by the lead agent; whatever Devin was doing is cut short and not reported")
+			out.summary(time.Since(start))
+			out.finish()
 			return
 		case err := <-done:
 			for len(events) > 0 {

@@ -28,7 +28,7 @@ func main() {
 		return
 	}
 	listen := flag.String("listen", envOr("CLAUDE_DEVIN_SERVE", "127.0.0.1:47821"), "the address to serve OpenCode on")
-	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin acp"), "command that starts Devin as an ACP agent")
+	devinCmd := flag.String("devin", envOr("CLAUDE_DEVIN_DEVIN", "devin --sandbox acp"), "command that starts Devin as an ACP agent")
 	devinIdle := flag.Duration("devin-idle", 10*time.Minute, "stop Devin after this long with no turn running (0 keeps it); its sessions are loaded again on the next turn")
 	devinEffort := flag.String("devin-effort", "high", "how hard Devin (SWE-2) thinks when a turn asks for nothing else: medium, high or max")
 	maxTasks := flag.Int("max-tasks", 6, "how many Devin tasks may run at once (0 for no limit); one more is answered with how to wait for room")
