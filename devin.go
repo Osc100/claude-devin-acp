@@ -105,9 +105,13 @@ func (d *devin) rested() {
 // and how hard it thinks is its `thought_level` (SWE-2 "Max" is this model at `max`).
 const sweModel = "swe-2-high"
 
+// flashModel is SWE-2 Flash, by Devin's own id: the permission reviewer's model, at medium, the
+// least thinking Devin takes for it. No turn asks for it.
+const flashModel = "swe-2-flash-medium"
+
 // lunaModel is GPT-6 Luna, by Devin's own id: the one other model a turn may ask for, always at
-// high (as lunaHigh), and the permission reviewer's while SWE-2 is under a long rate limit, at low
-// for speed.
+// high (as lunaHigh), and the permission reviewer's while SWE-2 Flash is under a long rate limit,
+// at low for speed.
 const lunaModel = "gpt-6-luna-medium"
 
 // lunaHigh is the name OpenCode asks for GPT-6 Luna at high by.
@@ -123,13 +127,16 @@ func offered(model string) string {
 
 // modelName is a Devin model's name as it is said.
 func modelName(model string) string {
-	if model == lunaModel {
+	switch model {
+	case lunaModel:
 		return "GPT-6 Luna"
+	case flashModel:
+		return "SWE-2 Flash"
 	}
 	return "SWE-2"
 }
 
-// efforts are the thinking levels Devin takes for SWE-2.
+// efforts are the thinking levels Devin takes for SWE-2 and SWE-2 Flash.
 var efforts = map[string]bool{"medium": true, "high": true, "max": true}
 
 // configure sets r's session to model (SWE-2 when empty) at effort (the default when empty; GPT-6
@@ -139,13 +146,13 @@ func (d *devin) configure(r *run, model, effort string) error {
 	switch model {
 	case "":
 		model = sweModel
-	case sweModel:
+	case sweModel, flashModel:
 	case lunaModel:
 		if effort != "high" {
 			effort = "low"
 		}
 	default:
-		return fmt.Errorf("no model %q: %s or %s", model, sweModel, lunaModel)
+		return fmt.Errorf("no model %q: %s, %s or %s", model, sweModel, flashModel, lunaModel)
 	}
 	if effort == "" {
 		effort = d.effort

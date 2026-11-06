@@ -208,18 +208,22 @@ func TestRateLimitedSessionsGoOnApart(t *testing.T) {
 	}
 }
 
-// The reviewer is on SWE-2, on GPT-6 Luna while SWE-2 is under a long limit, and with both
+// The reviewer is on SWE-2 Flash, on GPT-6 Luna while SWE-2 Flash is under a long limit, and with both
 // limited it cannot run: a request is denied at once, without opening it, and the denial is not
 // kept.
 func TestTheReviewerFallsBackToLuna(t *testing.T) {
 	d := newDevin(nil)
 	v := newReviewer(d, "", t.TempDir(), filepath.Join(t.TempDir(), "permissions.json"))
-	if model, _ := v.reviewerModel(); model != sweModel {
+	if model, _ := v.reviewerModel(); model != flashModel {
 		t.Errorf("unlimited, the reviewer is on %q", model)
 	}
 	d.longLimits[sweModel] = limit{model: sweModel, rate: true, until: time.Now().Add(time.Hour)}
-	if model, l := v.reviewerModel(); model != lunaModel || l == nil || l.model != sweModel {
-		t.Errorf("with SWE-2 limited, the reviewer is on %q (%+v)", model, l)
+	if model, _ := v.reviewerModel(); model != flashModel {
+		t.Errorf("with only SWE-2 limited, the reviewer is on %q", model)
+	}
+	d.longLimits[flashModel] = limit{model: flashModel, rate: true, until: time.Now().Add(time.Hour)}
+	if model, l := v.reviewerModel(); model != lunaModel || l == nil || l.model != flashModel {
+		t.Errorf("with SWE-2 Flash limited, the reviewer is on %q (%+v)", model, l)
 	}
 	d.longLimits[lunaModel] = limit{model: lunaModel, rate: true, until: time.Now().Add(time.Hour)}
 	got := v.review(&run{cwd: t.TempDir()}, map[string]any{"kind": "execute", "title": "go test ./..."})
